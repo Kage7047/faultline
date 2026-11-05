@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: unit tests, 200 seeds and the controls
+        run: go test -v ./...
+      - name: race detector
+        run: |
+          go test -race ./raft
+          go test -race -short -run 'TestSafety|TestLiveness|TestRunIsDeterministic' ./sim
+
+  # a different 2,000 seeds on every push: the more seeds ever run, the more the passing result means
+  soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: 2,000 fresh seeds
+        run: go test ./sim -run TestSafety -seeds 2000 -from $(( (${{ github.run_number }} * 2000) + 1000 )) -v
