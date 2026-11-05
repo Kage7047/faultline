@@ -75,18 +75,13 @@ func TestControlLeaderLocalReadsIsCaught(t *testing.T) {
 func requireCaughtKV(t *testing.T, mutate func(*Config)) {
 	t.Helper()
 	const budget = 200
-	var found atomic.Uint64
-	parallel(1, budget, func(seed uint64) {
-		if found.Load() != 0 {
-			return
-		}
+	seed, r := lowestCaught(budget, func(seed uint64) Result {
 		cfg := KVDefaults(seed)
 		mutate(&cfg)
-		if r := Run(cfg); r.Violation != "" && found.CompareAndSwap(0, seed) {
-			t.Logf("caught on seed %d: %s (%d ops)", seed, r.Violation, r.Stats.Ops)
-		}
+		return Run(cfg)
 	})
-	if found.Load() == 0 {
+	if seed == 0 {
 		t.Fatalf("the broken store survived %d seeds", budget)
 	}
+	t.Logf("caught on seed %d: %s (%d ops)", seed, r.Violation, r.Stats.Ops)
 }

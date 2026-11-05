@@ -127,22 +127,40 @@ func TestOneEntryPerMessageIsSafe(t *testing.T) {
 func requireCaught(t *testing.T, mutate func(*Config)) {
 	t.Helper()
 	const budget = 2000
-	var found atomic.Uint64
-	parallel(1, budget, func(seed uint64) {
-		if found.Load() != 0 {
-			return
-		}
+	seed, r := lowestCaught(budget, func(seed uint64) Result {
 		cfg := Defaults(seed)
 		mutate(&cfg)
-		if r := Run(cfg); r.Violation != "" {
-			if found.CompareAndSwap(0, seed) {
-				t.Logf("caught on seed %d: %s", seed, r.Violation)
-			}
-		}
+		return Run(cfg)
 	})
-	if found.Load() == 0 {
+	if seed == 0 {
 		t.Fatalf("broken raft survived %d seeds: the simulator cannot see this bug", budget)
 	}
+	t.Logf("caught on seed %d: %s", seed, r.Violation)
+}
+
+// lowestCaught runs seeds 1..budget in parallel and returns the lowest one with a violation, so
+// the reported seed does not depend on how many CPUs the machine has. Seeds above a known
+// violation are skipped.
+func lowestCaught(budget uint64, run func(uint64) Result) (uint64, Result) {
+	var mu sync.Mutex
+	var best uint64
+	var bestResult Result
+	parallel(1, budget, func(seed uint64) {
+		mu.Lock()
+		skip := best != 0 && seed > best
+		mu.Unlock()
+		if skip {
+			return
+		}
+		if r := run(seed); r.Violation != "" {
+			mu.Lock()
+			if best == 0 || seed < best {
+				best, bestResult = seed, r
+			}
+			mu.Unlock()
+		}
+	})
+	return best, bestResult
 }
 
 func parallel(first, n uint64, f func(seed uint64)) {

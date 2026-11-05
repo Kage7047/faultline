@@ -46,13 +46,14 @@ on every push.
 ## The controls
 
 A passing run only means something if broken code fails it. Every safety rule has a switch that
-turns it off, and a test that requires the simulator to catch the result:
+turns it off, and a test that requires the simulator to catch the result (the table shows the lowest
+seed that does, which is the same on every machine):
 
 | rule switched off | caught on | what the checker saw |
 |---|---|---|
-| vote only for a candidate whose log is at least as up to date (§5.4.1) | seed 4 | a leader of term 6 missing a committed entry |
+| vote only for a candidate whose log is at least as up to date (§5.4.1) | seed 2 | a leader of term 7 missing a committed entry |
 | commit only entries from the current term (§5.4.2, the Figure 8 bug) | seed 1,565 | a leader of term 64 missing a committed entry |
-| deduplicate retried requests by (client, seq) | seed 3 | no linearizable order: a retried append applied twice |
+| deduplicate retried requests by (client, seq) | seed 1 | no linearizable order: a retried append applied twice |
 | reads go through the log (a leader may not answer from local state) | seed 3 | no linearizable order: a cut-off leader served a stale value |
 
 Two of these are worth a closer look.
