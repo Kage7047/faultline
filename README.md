@@ -5,8 +5,9 @@
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 Raft consensus and a replicated key-value store in Go, built to be tested by a deterministic
-simulator. **Work in progress**: consensus, the store, linearizability checking, PreVote and
-CheckQuorum are done; snapshots and a real networked server are next (see [Roadmap](#roadmap)).
+simulator. **Work in progress**: consensus, the store, linearizability checking, PreVote,
+CheckQuorum and ReadIndex reads are done; snapshots and a real networked server are next (see
+[Roadmap](#roadmap)).
 
 The Raft node is a pure state machine. It does no I/O, starts no goroutines and reads no clock:
 the caller feeds it ticks and messages and collects what to persist, send and apply. That lets the
@@ -37,8 +38,8 @@ which searches for a single-copy order consistent with every result each client 
 |---|---:|---:|---:|---:|---:|---:|
 | consensus, PreVote on | 1,320 | 2,664 | 1,208 | 3,069,691 | | **0** |
 | consensus, classic | 2,853 | 2,669 | 1,233 | 2,928,685 | | **0** |
-| key-value, PreVote on | 648 | 1,302 | 599 | 6,190,094 | 127,063 | **0** |
-| key-value, classic | 1,114 | 1,346 | 603 | 5,571,790 | 113,296 | **0** |
+| key-value, PreVote on | 673 | 1,329 | 622 | 3,920,603 | 123,365 | **0** |
+| key-value, classic | 1,260 | 1,341 | 602 | 3,566,815 | 108,200 | **0** |
 
 CI also runs 2,000 consensus seeds and 300 key-value seeds per mode that no run has used before,
 on every push.
@@ -54,9 +55,10 @@ seed that does, which is the same on every machine):
 | vote only for a candidate whose log is at least as up to date (§5.4.1) | seed 2 | a leader of term 7 missing a committed entry |
 | commit only entries from the current term (§5.4.2, the Figure 8 bug) | seed 1,565 | a leader of term 64 missing a committed entry |
 | deduplicate retried requests by (client, seq) | seed 1 | no linearizable order: a retried append applied twice |
-| reads go through the log (a leader may not answer from local state) | seed 3 | no linearizable order: a cut-off leader served a stale value |
+| confirm leadership with a majority before answering a read (ReadIndex) | seed 3 | no linearizable order: a cut-off leader served a stale value |
+| a new leader serves reads only after committing an entry of its own term | seed 39 | no linearizable order: a read missed a write that had already completed |
 
-Two of these are worth a closer look.
+Three of these are worth a closer look.
 
 **The Figure 8 bug survived 1,564 hostile runs.** A new leader's no-op travels in the same message
 as the old entries before it, so an old-term entry almost never reaches a majority on its own.
@@ -68,6 +70,23 @@ cut term growth by 90% on the same seeds (`TestPreVoteReducesElections`), which 
 in production. With them on, the Figure 8 control survived 2,000 seeds and the stale-read control
 200: the windows those bugs need almost never open. The bugs are still there, so every safety test
 runs in both modes, and those two controls run with both features off.
+
+**A bug hidden by the code next to it.** A new leader does not know the cluster's commit index
+until its own no-op commits; answering a read before then can miss a write the old leader already
+confirmed. But the heartbeat round that confirms the read usually carries the no-op as well, so
+the commit index catches up in the same step and the read comes out fresh. 200 seeds in both
+modes missed it. With one entry per message, a lagging follower confirms the read before it has
+the no-op, and seed 39 shows the stale read. The same setting with the rule on stays
+linearizable (`TestOneEntryPerMessageIsLinearizable`).
+
+## ReadIndex reads
+
+A read does not need a log entry; it needs proof that no newer leader exists (§6.4 of Ongaro's
+thesis). The leader notes its commit index, and every heartbeat carries a read sequence number
+that followers echo back. Once a majority has echoed it, nobody else can have committed anything
+the leader does not know, and the read is served as soon as the local store has applied that
+index. On the same 50 seeds (`TestReadIndexSavesLogWrites`) log entries per operation drop from
+1.06 to 0.64, and the history stays linearizable.
 
 ## PreVote and CheckQuorum
 
@@ -81,7 +100,7 @@ makes a leader that cannot reach a majority step down instead of believing it le
 ## Layout
 
 ```
-raft/   the consensus algorithm: elections, replication, commit, PreVote, CheckQuorum, restart
+raft/   the consensus algorithm: elections, replication, commit, PreVote, CheckQuorum, ReadIndex, restart
 kv/     the replicated state machine: get/put/append with client sessions (exactly-once retries)
 sim/    the deterministic simulator, fault model, clients, safety checker and Porcupine model
 ```
@@ -103,7 +122,7 @@ go test -race -short ./...
 - [x] Key-value state machine with client sessions (exactly-once writes across retries)
 - [x] Linearizability checking of client histories (Porcupine) in every simulated run
 - [x] PreVote and CheckQuorum, and a test showing why: a node back from a partition deposing a healthy leader
-- [ ] ReadIndex reads (linearizable without a log write), with the stale-read control kept honest
+- [x] ReadIndex reads (linearizable without a log write), with controls for both of its rules
 - [ ] Snapshots and log compaction
 - [ ] A real server: networked transport, an HTTP API, a local 3-node cluster you can `kill -9`
 - [ ] A write-up of what the simulator found

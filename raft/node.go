@@ -6,8 +6,13 @@ import (
 	"slices"
 )
 
-// ErrNotLeader is returned by Propose on a node that is not the leader. Leader() may name one.
+// ErrNotLeader is returned by Propose and ReadIndex on a node that is not the leader. Leader()
+// may name one.
 var ErrNotLeader = errors.New("raft: not the leader")
+
+// ErrReadNotReady is returned by ReadIndex on a new leader that has not yet committed an entry
+// of its own term, so it does not know the cluster's commit index yet. Retry shortly.
+var ErrReadNotReady = errors.New("raft: leader has not committed in its term yet")
 
 // Node is one Raft peer. It is not safe for concurrent use; the caller serialises calls.
 type Node struct {
@@ -34,8 +39,19 @@ type Node struct {
 	next   map[NodeID]Index // leader: next index to send
 	match  map[NodeID]Index // leader: highest index known replicated
 
+	readSeq    uint64        // leader: last read sequence number handed out
+	reads      []pendingRead // leader: reads waiting for a majority to confirm leadership
+	readStates []ReadState
+
 	msgs   []Message
 	prevHS HardState
+}
+
+type pendingRead struct {
+	seq   uint64
+	ctx   uint64
+	index Index
+	acks  map[NodeID]bool
 }
 
 // NewNode starts a node from what it persisted before (zero values for a brand-new node).
@@ -109,6 +125,30 @@ func (n *Node) Propose(data []byte) (Index, Term, error) {
 	return idx, n.term, nil
 }
 
+// ReadIndex starts a linearizable read without writing to the log (§6.4 of Ongaro's thesis).
+// The leader records its commit index, then confirms with one heartbeat round that a majority
+// still follows it: no newer leader can have committed anything it does not know about. The
+// answer comes back in Ready.ReadStates with the same ctx; the caller reads its state machine
+// once it has applied that index. If leadership is lost first, the read is dropped and the
+// caller times out.
+func (n *Node) ReadIndex(ctx uint64) error {
+	if n.role != Leader {
+		return ErrNotLeader
+	}
+	// Until an entry of this term commits, n.commit may be behind what the old leader committed.
+	if n.log.term(n.commit) != n.term && !n.cfg.Unsafe.ReadBeforeTermCommit {
+		return ErrReadNotReady
+	}
+	if len(n.peers) == 1 || n.cfg.Unsafe.ReadWithoutQuorum {
+		n.readStates = append(n.readStates, ReadState{Index: n.commit, Ctx: ctx})
+		return nil
+	}
+	n.readSeq++
+	n.reads = append(n.reads, pendingRead{seq: n.readSeq, ctx: ctx, index: n.commit, acks: map[NodeID]bool{n.id: true}})
+	n.broadcastAppend()
+	return nil
+}
+
 // Step processes one message from a peer.
 func (n *Node) Step(m Message) {
 	switch {
@@ -161,21 +201,23 @@ func (n *Node) Step(m Message) {
 
 // HasReady reports whether Ready would return anything.
 func (n *Node) HasReady() bool {
-	return len(n.msgs) > 0 || n.log.stable < n.log.lastIndex() || n.hardState() != n.prevHS || n.commit > n.applied
+	return len(n.msgs) > 0 || n.log.stable < n.log.lastIndex() || n.hardState() != n.prevHS || n.commit > n.applied ||
+		len(n.readStates) > 0
 }
 
 // Ready collects the node's output. See the Ready type for the caller's obligations.
 func (n *Node) Ready() Ready {
 	hs := n.hardState()
 	rd := Ready{
-		SoftState: SoftState{Role: n.role, Lead: n.lead},
-		HardState: hs,
-		MustSync:  hs != n.prevHS,
-		Entries:   n.log.unstable(),
-		Messages:  n.msgs,
-		Committed: n.log.slice(n.applied+1, n.commit),
+		SoftState:  SoftState{Role: n.role, Lead: n.lead},
+		HardState:  hs,
+		MustSync:   hs != n.prevHS,
+		Entries:    n.log.unstable(),
+		Messages:   n.msgs,
+		Committed:  n.log.slice(n.applied+1, n.commit),
+		ReadStates: n.readStates,
 	}
-	n.msgs = nil
+	n.msgs, n.readStates = nil, nil
 	return rd
 }
 
@@ -215,6 +257,7 @@ func (n *Node) becomeFollower(term Term, lead NodeID) {
 	}
 	n.role = Follower
 	n.lead = lead
+	n.reads = nil // unconfirmed reads die with the leadership; their callers time out
 	n.resetElectionTimer()
 }
 
@@ -384,6 +427,7 @@ func (n *Node) sendAppend(to NodeID) {
 		PrevTerm:  n.log.term(prev),
 		Entries:   n.log.slice(next, hi),
 		Commit:    n.commit,
+		ReadSeq:   n.readSeq,
 	})
 }
 
@@ -393,12 +437,15 @@ func (n *Node) handleAppend(m Message) {
 	n.lead = m.From
 	n.resetElectionTimer()
 
+	// Every answer echoes ReadSeq, rejections included: a rejection in this term still says
+	// "you are my leader", which is all a read needs.
 	if m.PrevIndex > n.log.lastIndex() {
-		n.send(Message{Type: MsgAppResp, To: m.From, ConflictIndex: n.log.lastIndex() + 1})
+		n.send(Message{Type: MsgAppResp, To: m.From, ConflictIndex: n.log.lastIndex() + 1, ReadSeq: m.ReadSeq})
 		return
 	}
 	if t := n.log.term(m.PrevIndex); t != m.PrevTerm {
-		n.send(Message{Type: MsgAppResp, To: m.From, ConflictTerm: t, ConflictIndex: n.log.firstIndexOfTerm(m.PrevIndex)})
+		n.send(Message{Type: MsgAppResp, To: m.From, ConflictTerm: t, ConflictIndex: n.log.firstIndexOfTerm(m.PrevIndex),
+			ReadSeq: m.ReadSeq})
 		return
 	}
 	// Skip entries we already have; truncate at the first conflict and append the rest (§5.3).
@@ -413,7 +460,7 @@ func (n *Node) handleAppend(m Message) {
 	if c := min(m.Commit, lastNew); c > n.commit {
 		n.commit = c
 	}
-	n.send(Message{Type: MsgAppResp, To: m.From, Success: true, MatchIndex: lastNew})
+	n.send(Message{Type: MsgAppResp, To: m.From, Success: true, MatchIndex: lastNew, ReadSeq: m.ReadSeq})
 }
 
 func (n *Node) handleAppendResp(m Message) {
@@ -422,6 +469,9 @@ func (n *Node) handleAppendResp(m Message) {
 	}
 	p := m.From
 	n.active[p] = true
+	if m.ReadSeq > 0 {
+		n.ackReads(p, m.ReadSeq)
+	}
 	if m.Success {
 		if m.MatchIndex > n.match[p] {
 			n.match[p] = m.MatchIndex
@@ -443,6 +493,26 @@ func (n *Node) handleAppendResp(m Message) {
 	// A stale rejection must not move next below what the follower is known to hold.
 	n.next[p] = max(min(next, n.log.lastIndex()+1), n.match[p]+1, 1)
 	n.sendAppend(p)
+}
+
+// ackReads records that peer still followed this leader after read seq was asked, which covers
+// every read asked before it too. Reads are released in order once a majority has answered.
+func (n *Node) ackReads(peer NodeID, seq uint64) {
+	done := 0
+	for i := range n.reads {
+		r := &n.reads[i]
+		if r.seq > seq {
+			break
+		}
+		r.acks[peer] = true
+		if len(r.acks) > len(n.peers)/2 {
+			done = i + 1 // acks only grow towards older reads, so all reads before i are done too
+		}
+	}
+	for _, r := range n.reads[:done] {
+		n.readStates = append(n.readStates, ReadState{Index: r.index, Ctx: r.ctx})
+	}
+	n.reads = n.reads[done:]
 }
 
 // maybeCommit advances commit to the highest index replicated on a majority, but only to an
