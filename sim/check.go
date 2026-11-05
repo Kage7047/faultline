@@ -36,7 +36,11 @@ func (c *checker) leader(id raft.NodeID, term raft.Term, log []raft.Entry) strin
 	}
 	c.leaders[term] = id
 	// Leader Completeness: a leader's log holds every entry committed in an earlier term.
-	for idx, e := range c.committed {
+	for idx := raft.Index(1); idx <= c.maxIndex; idx++ { // in index order, so reports are deterministic
+		e, ok := c.committed[idx]
+		if !ok {
+			continue
+		}
 		if int(idx) > len(log) || !sameEntry(log[idx-1], e) {
 			return fmt.Sprintf("leader completeness: leader %d of term %d is missing committed entry %d (term %d, %q)",
 				id, term, idx, e.Term, e.Data)
