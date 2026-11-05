@@ -26,6 +26,7 @@ type Role uint8
 
 const (
 	Follower Role = iota
+	PreCandidate
 	Candidate
 	Leader
 )
@@ -34,6 +35,8 @@ func (r Role) String() string {
 	switch r {
 	case Follower:
 		return "follower"
+	case PreCandidate:
+		return "pre-candidate"
 	case Candidate:
 		return "candidate"
 	case Leader:
@@ -57,10 +60,12 @@ const (
 	MsgVoteResp
 	MsgApp
 	MsgAppResp
+	MsgPreVote
+	MsgPreVoteResp
 )
 
 func (t MsgType) String() string {
-	return [...]string{"MsgVote", "MsgVoteResp", "MsgApp", "MsgAppResp"}[t]
+	return [...]string{"MsgVote", "MsgVoteResp", "MsgApp", "MsgAppResp", "MsgPreVote", "MsgPreVoteResp"}[t]
 }
 
 // Message is every RPC and response in one struct. Fields not used by a type stay zero.
@@ -94,9 +99,9 @@ type Message struct {
 
 func (m Message) String() string {
 	switch m.Type {
-	case MsgVote:
+	case MsgVote, MsgPreVote:
 		return fmt.Sprintf("%d->%d %s t%d last=%d@t%d", m.From, m.To, m.Type, m.Term, m.LastIndex, m.LastTerm)
-	case MsgVoteResp:
+	case MsgVoteResp, MsgPreVoteResp:
 		return fmt.Sprintf("%d->%d %s t%d granted=%v", m.From, m.To, m.Type, m.Term, m.Granted)
 	case MsgApp:
 		return fmt.Sprintf("%d->%d %s t%d prev=%d@t%d n=%d commit=%d", m.From, m.To, m.Type, m.Term, m.PrevIndex,
@@ -149,6 +154,15 @@ type Config struct {
 	// Seed makes election timeouts deterministic.
 	Seed uint64
 
+	// PreVote (§9.6 of Ongaro's thesis): before starting an election, a node asks whether it
+	// could win, without bumping its term. A node coming back from a partition then cannot force
+	// a healthy leader to step down just because its term grew while it was cut off.
+	PreVote bool
+	// CheckQuorum: a leader that has not heard from a majority within an election timeout steps
+	// down, and a node that has heard from a leader within that time ignores vote requests
+	// (leader stickiness). Together with PreVote this keeps a stable cluster stable.
+	CheckQuorum bool
+
 	// Unsafe switches turn off one safety rule each. They exist so tests can prove the
 	// simulator catches the bugs these rules prevent. Never set them outside tests.
 	Unsafe Unsafe
@@ -156,7 +170,8 @@ type Config struct {
 
 // Unsafe disables individual safety rules (see Config.Unsafe).
 type Unsafe struct {
-	// GrantAnyVote skips the "candidate's log is at least as up to date" check (§5.4.1).
+	// GrantAnyVote skips the "candidate's log is at least as up to date" check (§5.4.1), in
+	// votes and pre-votes alike.
 	GrantAnyVote bool
 	// CommitOldTerms lets a leader commit entries from earlier terms by counting replicas
 	// (the bug in Figure 8 of the Raft paper).

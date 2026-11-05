@@ -46,5 +46,7 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: 2,000 fresh seeds
+      - name: 2,000 fresh consensus seeds per mode
         run: go test ./sim -run TestSafety -seeds 2000 -from $(( (${{ github.run_number }} * 2000) + 1000 )) -v
+      - name: 300 fresh linearizability seeds per mode
+        run: go test ./sim -run TestLinearizable -kvseeds 300 -from $(( (${{ github.run_number }} * 300) + 1000 )) -v -timeout 30m

@@ -224,3 +224,52 @@ func TestFollowersConvergeToLeaderLog(t *testing.T) {
 		})
 	}
 }
+
+// A node cut off from the cluster keeps timing out. Without PreVote each timeout bumps its term,
+// and when it comes back its higher term forces the healthy leader to step down: an election
+// nobody needed. With PreVote (and CheckQuorum's leader stickiness) its term never moves.
+func TestReturningNodeAndPreVote(t *testing.T) {
+	for _, preVote := range []bool{false, true} {
+		t.Run(map[bool]string{false: "without", true: "with"}[preVote], func(t *testing.T) {
+			c := newCluster(t, 3)
+			for id := range c.nodes {
+				c.nodes[id] = NewNode(Config{ID: id, Peers: []NodeID{1, 2, 3}, Seed: 1, PreVote: preVote, CheckQuorum: preVote},
+					HardState{}, nil, 0)
+			}
+			c.elect(1)
+			term := c.nodes[1].Term()
+
+			c.drop = func(m Message) bool { return m.From == 3 || m.To == 3 }
+			for range 200 { // node 3 alone, timing out over and over
+				c.nodes[3].Tick()
+				c.settle()
+			}
+			c.drop = func(Message) bool { return false }
+			c.nodes[1].Tick() // the leader's next heartbeat reaches node 3 again
+			c.settle()
+
+			disrupted := c.nodes[1].Role() != Leader || c.nodes[1].Term() != term
+			if disrupted != !preVote {
+				t.Fatalf("preVote=%v: leader 1 role=%v term %d -> %d, node 3 term %d", preVote, c.nodes[1].Role(), term,
+					c.nodes[1].Term(), c.nodes[3].Term())
+			}
+			t.Logf("leader term %d -> %d, returning node at term %d", term, c.nodes[1].Term(), c.nodes[3].Term())
+		})
+	}
+}
+
+func TestCheckQuorumLeaderStepsDownWhenCutOff(t *testing.T) {
+	c := newCluster(t, 3)
+	for id := range c.nodes {
+		c.nodes[id] = NewNode(Config{ID: id, Peers: []NodeID{1, 2, 3}, Seed: 1, PreVote: true, CheckQuorum: true}, HardState{}, nil, 0)
+	}
+	c.elect(1)
+	c.drop = func(m Message) bool { return m.From == 1 || m.To == 1 }
+	for range 2 * 10 { // two election timeouts of silence from the followers
+		c.nodes[1].Tick()
+		c.settle()
+	}
+	if c.nodes[1].Role() == Leader {
+		t.Fatal("a leader cut off from every follower still believes it leads")
+	}
+}

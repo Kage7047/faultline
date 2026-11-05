@@ -29,9 +29,10 @@ type Node struct {
 	electionTimeout  int // randomised per election
 	rng              *rand.Rand
 
-	votes map[NodeID]bool  // candidate: responses received
-	next  map[NodeID]Index // leader: next index to send
-	match map[NodeID]Index // leader: highest index known replicated
+	votes  map[NodeID]bool  // (pre-)candidate: responses received
+	active map[NodeID]bool  // leader: peers heard from since the last quorum check
+	next   map[NodeID]Index // leader: next index to send
+	match  map[NodeID]Index // leader: highest index known replicated
 
 	msgs   []Message
 	prevHS HardState
@@ -69,6 +70,14 @@ func NewNode(cfg Config, hs HardState, entries []Entry, applied Index) *Node {
 // Tick advances the node's clock by one tick.
 func (n *Node) Tick() {
 	if n.role == Leader {
+		n.electionElapsed++
+		if n.electionElapsed >= n.cfg.ElectionTicks {
+			n.electionElapsed = 0
+			if n.cfg.CheckQuorum && !n.quorumActive() {
+				n.becomeFollower(n.term, None) // cut off from the majority: stop claiming to lead
+				return
+			}
+		}
 		n.heartbeatElapsed++
 		if n.heartbeatElapsed >= n.cfg.HeartbeatTicks {
 			n.heartbeatElapsed = 0
@@ -78,7 +87,11 @@ func (n *Node) Tick() {
 	}
 	n.electionElapsed++
 	if n.electionElapsed >= n.electionTimeout {
-		n.campaign()
+		if n.cfg.PreVote {
+			n.preCampaign()
+		} else {
+			n.campaign()
+		}
 	}
 }
 
@@ -100,11 +113,21 @@ func (n *Node) Propose(data []byte) (Index, Term, error) {
 func (n *Node) Step(m Message) {
 	switch {
 	case m.Term > n.term:
-		lead := None
-		if m.Type == MsgApp {
-			lead = m.From
+		if (m.Type == MsgVote || m.Type == MsgPreVote) && n.inLease() {
+			return // we have a live leader: a would-be candidate is the one out of date
 		}
-		n.becomeFollower(m.Term, lead)
+		switch {
+		case m.Type == MsgPreVote:
+			// a pre-vote asks about a future term; it does not move ours
+		case m.Type == MsgPreVoteResp && m.Granted:
+			// a granted pre-vote echoes the term we would campaign for
+		default:
+			lead := None
+			if m.Type == MsgApp {
+				lead = m.From
+			}
+			n.becomeFollower(m.Term, lead)
+		}
 	case m.Term < n.term:
 		// A stale leader or candidate learns the current term from the rejection and steps down.
 		switch m.Type {
@@ -112,11 +135,17 @@ func (n *Node) Step(m Message) {
 			n.send(Message{Type: MsgAppResp, To: m.From, Success: false})
 		case MsgVote:
 			n.send(Message{Type: MsgVoteResp, To: m.From, Granted: false})
+		case MsgPreVote:
+			n.send(Message{Type: MsgPreVoteResp, To: m.From, Granted: false})
 		}
 		return
 	}
 
 	switch m.Type {
+	case MsgPreVote:
+		n.handlePreVote(m)
+	case MsgPreVoteResp:
+		n.handlePreVoteResp(m)
 	case MsgVote:
 		n.handleVote(m)
 	case MsgVoteResp:
@@ -189,6 +218,24 @@ func (n *Node) becomeFollower(term Term, lead NodeID) {
 	n.resetElectionTimer()
 }
 
+// preCampaign asks the cluster whether this node could win an election in the next term,
+// without changing any state that a real election would.
+func (n *Node) preCampaign() {
+	n.role = PreCandidate
+	n.lead = None
+	n.votes = map[NodeID]bool{n.id: true}
+	n.resetElectionTimer()
+	if n.quorum(n.votes, true) {
+		n.campaign()
+		return
+	}
+	for _, p := range n.peers {
+		if p != n.id {
+			n.send(Message{Type: MsgPreVote, To: p, Term: n.term + 1, LastIndex: n.log.lastIndex(), LastTerm: n.log.lastTerm()})
+		}
+	}
+}
+
 func (n *Node) campaign() {
 	n.role = Candidate
 	n.term++
@@ -211,6 +258,8 @@ func (n *Node) becomeLeader() {
 	n.role = Leader
 	n.lead = n.id
 	n.heartbeatElapsed = 0
+	n.electionElapsed = 0
+	n.active = map[NodeID]bool{}
 	n.next = make(map[NodeID]Index, len(n.peers))
 	n.match = make(map[NodeID]Index, len(n.peers))
 	for _, p := range n.peers {
@@ -237,6 +286,48 @@ func (n *Node) handleVote(m Message) {
 		n.resetElectionTimer() // granting a vote counts as hearing from a candidate (§5.2)
 	}
 	n.send(Message{Type: MsgVoteResp, To: m.From, Granted: granted})
+}
+
+// handlePreVote grants if the candidate could legitimately win: its proposed term is newer and
+// its log is at least as up to date. Nothing is recorded; a pre-vote binds no one.
+func (n *Node) handlePreVote(m Message) {
+	upToDate := n.cfg.Unsafe.GrantAnyVote || n.log.isUpToDate(m.LastIndex, m.LastTerm)
+	if m.Term > n.term && upToDate {
+		n.send(Message{Type: MsgPreVoteResp, To: m.From, Term: m.Term, Granted: true})
+		return
+	}
+	n.send(Message{Type: MsgPreVoteResp, To: m.From, Granted: false})
+}
+
+func (n *Node) handlePreVoteResp(m Message) {
+	if n.role != PreCandidate {
+		return
+	}
+	n.votes[m.From] = m.Granted
+	switch {
+	case n.quorum(n.votes, true):
+		n.campaign()
+	case n.quorum(n.votes, false):
+		n.becomeFollower(n.term, None)
+	}
+}
+
+// inLease reports whether this node heard from a leader within the minimum election timeout.
+func (n *Node) inLease() bool {
+	return n.cfg.CheckQuorum && n.lead != None && n.electionElapsed < n.cfg.ElectionTicks
+}
+
+// quorumActive reports whether a majority (counting this leader) was heard from since the last
+// check, and starts a new round.
+func (n *Node) quorumActive() bool {
+	c := 1
+	for _, p := range n.peers {
+		if p != n.id && n.active[p] {
+			c++
+		}
+	}
+	n.active = map[NodeID]bool{}
+	return c > len(n.peers)/2
 }
 
 func (n *Node) handleVoteResp(m Message) {
@@ -330,6 +421,7 @@ func (n *Node) handleAppendResp(m Message) {
 		return
 	}
 	p := m.From
+	n.active[p] = true
 	if m.Success {
 		if m.MatchIndex > n.match[p] {
 			n.match[p] = m.MatchIndex
@@ -374,6 +466,8 @@ func (n *Node) maybeCommit() bool {
 
 func (n *Node) send(m Message) {
 	m.From = n.id
-	m.Term = n.term
+	if m.Term == 0 { // pre-votes carry a future term; everything else carries ours
+		m.Term = n.term
+	}
 	n.msgs = append(n.msgs, m)
 }

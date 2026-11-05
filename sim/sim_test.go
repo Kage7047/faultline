@@ -17,9 +17,28 @@ var (
 	only  = flag.Uint64("seed", 0, "run just this seed (to reproduce a failure)")
 )
 
+// modes are the two configurations every safety test runs in. PreVote and CheckQuorum make
+// elections rarer, which is good for a cluster and bad for a test: fewer elections means fewer
+// chances to hit an election bug. So the classic mode, with both off, runs too.
+var modes = []struct {
+	name string
+	set  func(*Config)
+}{
+	{"prevote", func(*Config) {}},
+	{"classic", classic},
+}
+
+func classic(c *Config) { c.Raft.PreVote, c.Raft.CheckQuorum = false, false }
+
 // TestSafety runs many seeded simulations with crashes, partitions, loss, duplication and
 // reordering, and fails on the first safety violation with a command that replays it.
 func TestSafety(t *testing.T) {
+	for _, m := range modes {
+		t.Run(m.name, func(t *testing.T) { testSafety(t, m.set) })
+	}
+}
+
+func testSafety(t *testing.T, mode func(*Config)) {
 	first, n := *from, uint64(*seeds)
 	if *only != 0 {
 		first, n = *only, 1
@@ -31,12 +50,14 @@ func TestSafety(t *testing.T) {
 	var mu sync.Mutex
 	var total Stats
 	parallel(first, n, func(seed uint64) {
-		r := Run(Defaults(seed))
+		cfg := Defaults(seed)
+		mode(&cfg)
+		r := Run(cfg)
 		mu.Lock()
 		defer mu.Unlock()
 		add(&total, r.Stats)
 		if r.Violation != "" && failed.CompareAndSwap(false, true) {
-			t.Errorf("%s\nreproduce: go test ./sim -run TestSafety -seed %d -v", r, seed)
+			t.Errorf("%s\nreproduce: go test ./sim -run %s -seed %d -v", r, t.Name(), seed)
 		}
 		// liveness: after the quiet tail every node has caught up with what was committed
 		for id, c := range r.Stats.FinalCommit {
@@ -80,9 +101,12 @@ func TestControlGrantAnyVoteIsCaught(t *testing.T) {
 
 // Figure 8's bug needs an old-term entry to reach a majority before the new leader's no-op does.
 // When both travel in one message that almost never happens, so this control sends one entry
-// per message, which lets old entries run ahead of the no-op on a lagging follower.
+// per message, which lets old entries run ahead of the no-op on a lagging follower. It also
+// needs leader churn, so it runs in classic mode: with PreVote and CheckQuorum on, 2,000 seeds
+// did not open the window once.
 func TestControlCommitOldTermsIsCaught(t *testing.T) {
 	requireCaught(t, func(c *Config) {
+		classic(c)
 		c.Raft.Unsafe.CommitOldTerms = true
 		c.Raft.MaxEntriesPerMsg = 1
 	})
@@ -92,6 +116,7 @@ func TestControlCommitOldTermsIsCaught(t *testing.T) {
 func TestOneEntryPerMessageIsSafe(t *testing.T) {
 	parallel(1, 200, func(seed uint64) {
 		cfg := Defaults(seed)
+		classic(&cfg)
 		cfg.Raft.MaxEntriesPerMsg = 1
 		if r := Run(cfg); r.Violation != "" {
 			t.Errorf("%s", r)

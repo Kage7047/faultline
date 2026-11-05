@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"strings"
 
+	"github.com/Kage7047/faultline/kv"
 	"github.com/Kage7047/faultline/raft"
 )
 
@@ -30,8 +31,19 @@ type Config struct {
 	Faults    bool
 	QuietTail int64
 
-	ProposeEvery int64
+	ProposeEvery int64       // raw proposals to a random node (consensus-only runs)
 	Raft         raft.Config // ID, Peers and Seed are filled in per node
+
+	// Clients > 0 runs the key-value store with that many clients, and checks the history of
+	// what they saw for linearizability at the end.
+	Clients       int
+	Keys          int
+	ClientTimeout int64
+	CheckTimeout  int64 // ms the linearizability checker may take before giving up (inconclusive)
+	// Unsafe key-value switches for the controls.
+	UnsafeNoDedup          bool   // apply retried writes again
+	UnsafeLeaderLocalReads bool   // a leader answers reads from local state without confirming it still leads
+	VisualizePath          string // write Porcupine's HTML view of a non-linearizable history here
 
 	TraceLen      int  // how many recent events to keep for a failure report
 	TraceMessages bool // also record every delivered message (verbose; for debugging a seed)
@@ -51,9 +63,20 @@ func Defaults(seed uint64) Config {
 		Faults:       true,
 		QuietTail:    5_000,
 		ProposeEvery: 15,
-		Raft:         raft.Config{ElectionTicks: 15, HeartbeatTicks: 3},
+		Raft:         raft.Config{ElectionTicks: 15, HeartbeatTicks: 3, PreVote: true, CheckQuorum: true},
 		TraceLen:     60,
 	}
+}
+
+// KVDefaults is Defaults with clients talking to the key-value store instead of raw proposals.
+func KVDefaults(seed uint64) Config {
+	c := Defaults(seed)
+	c.ProposeEvery = 0
+	c.Clients = 5
+	c.Keys = 3
+	c.ClientTimeout = 300
+	c.CheckTimeout = 20_000
+	return c
 }
 
 // Stats summarises a run.
@@ -68,6 +91,9 @@ type Stats struct {
 	Dropped     int
 	Duplicated  int
 	FinalCommit []raft.Index // per node, at the end
+
+	Ops     int // client operations that completed
+	Retries int // client resends after a timeout or a "not leader" answer
 }
 
 // Result is what a run found.
@@ -75,6 +101,8 @@ type Result struct {
 	Stats     Stats
 	Violation string // empty if every check passed
 	Trace     []string
+	// Inconclusive is set when the linearizability checker ran out of time.
+	Inconclusive bool
 }
 
 func (r Result) String() string {
@@ -82,6 +110,9 @@ func (r Result) String() string {
 	s := r.Stats
 	fmt.Fprintf(&b, "leaders=%d maxTerm=%d proposed=%d committed=%d crashes=%d partitions=%d msgs=%d dropped=%d dup=%d",
 		s.Leaders, s.MaxTerm, s.Proposed, s.Committed, s.Crashes, s.Partitions, s.Sent, s.Dropped, s.Duplicated)
+	if s.Ops > 0 {
+		fmt.Fprintf(&b, " ops=%d retries=%d", s.Ops, s.Retries)
+	}
 	if r.Violation != "" {
 		fmt.Fprintf(&b, "\nVIOLATION: %s\nlast events:\n  %s", r.Violation, strings.Join(r.Trace, "\n  "))
 	}
@@ -102,6 +133,9 @@ type node struct {
 	restarts  uint64
 	group     int // partition group; nodes talk only within a group
 	wasLeader raft.Term
+
+	store   *kv.Store
+	waiters map[raft.Index]waiter // client requests this node proposed, by log index
 }
 
 // Sim is one run in progress.
@@ -118,6 +152,10 @@ type Sim struct {
 	healAt    int64
 	trace     []string
 	violation string
+
+	clients      []*client
+	history      []historyOp
+	inconclusive bool
 }
 
 // Run executes a whole simulation and reports what it found.
@@ -129,6 +167,9 @@ func Run(cfg Config) Result {
 	if s.violation == "" {
 		s.finalChecks()
 	}
+	if s.violation == "" && cfg.Clients > 0 {
+		s.checkLinearizable()
+	}
 	for _, n := range s.nodes {
 		c := raft.Index(0)
 		if n.r != nil {
@@ -137,7 +178,7 @@ func Run(cfg Config) Result {
 		s.stats.FinalCommit = append(s.stats.FinalCommit, c)
 	}
 	s.stats.Committed = s.check.maxCommitted()
-	return Result{Stats: s.stats, Violation: s.violation, Trace: s.trace}
+	return Result{Stats: s.stats, Violation: s.violation, Trace: s.trace, Inconclusive: s.inconclusive}
 }
 
 // New builds a cluster without running it.
@@ -148,6 +189,9 @@ func New(cfg Config) *Sim {
 		n.nextTick = s.rng.Int64N(cfg.TickMs) // nodes' clocks are not aligned
 		s.nodes = append(s.nodes, n)
 		s.start(n)
+	}
+	for i := range cfg.Clients {
+		s.clients = append(s.clients, &client{id: i, guess: raft.NodeID(1 + s.rng.IntN(cfg.Nodes))})
 	}
 	return s
 }
@@ -167,6 +211,9 @@ func (s *Sim) start(n *node) {
 	c.Seed = s.cfg.Seed*1_000_003 + uint64(n.id)*7919 + n.restarts
 	// A restarted node has an empty state machine: it re-applies the committed log from index 1.
 	n.r = raft.NewNode(c, n.disk.hs, n.disk.entries, 0)
+	n.store = kv.New()
+	n.store.UnsafeNoDedup = s.cfg.UnsafeNoDedup
+	n.waiters = map[raft.Index]waiter{}
 	s.check.restarted(n.id)
 }
 
@@ -174,8 +221,16 @@ func (s *Sim) start(n *node) {
 func (s *Sim) step() {
 	for s.queue.Len() > 0 && s.queue[0].at <= s.now && s.violation == "" {
 		e := heap.Pop(&s.queue).(envelope)
-		s.deliver(e.m)
+		switch e.kind {
+		case toNode:
+			s.deliver(e.m)
+		case toServer:
+			s.serve(e.req)
+		case toClient:
+			s.clientReceive(e.resp)
+		}
 	}
+	s.runClients()
 	for _, n := range s.nodes {
 		if s.violation != "" {
 			return
@@ -241,6 +296,9 @@ func (s *Sim) process(n *node) {
 		s.stats.MaxTerm = max(s.stats.MaxTerm, rd.HardState.Term)
 		for _, e := range rd.Committed {
 			s.fail(s.check.apply(n.id, e))
+			if s.cfg.Clients > 0 && e.Data != nil {
+				s.applyCommand(n, e)
+			}
 		}
 		n.r.Advance(rd)
 	}
@@ -258,13 +316,20 @@ func (s *Sim) send(m raft.Message) {
 		s.stats.Duplicated++
 	}
 	for range copies {
-		lat := s.cfg.MinLatency + s.rng.Int64N(s.cfg.MaxLatency-s.cfg.MinLatency+1)
-		if s.rng.Float64() < 0.01 {
-			lat *= 10 // a long tail: some messages arrive very late, after newer ones
-		}
-		s.seq++
-		heap.Push(&s.queue, envelope{at: s.now + lat, seq: s.seq, m: m})
+		s.enqueue(envelope{kind: toNode, m: m})
 	}
+}
+
+// enqueue schedules delivery after a random latency with a long tail: about 1% of messages
+// arrive ten times later than usual, after newer ones.
+func (s *Sim) enqueue(e envelope) {
+	lat := s.cfg.MinLatency + s.rng.Int64N(s.cfg.MaxLatency-s.cfg.MinLatency+1)
+	if s.rng.Float64() < 0.01 {
+		lat *= 10
+	}
+	s.seq++
+	e.at, e.seq = s.now+lat, s.seq
+	heap.Push(&s.queue, e)
 }
 
 func (s *Sim) propose() {
@@ -365,10 +430,21 @@ func (s *Sim) logf(format string, args ...any) {
 
 // ---- message queue: a min-heap on (delivery time, send order) --------------------------------
 
+type envelopeKind uint8
+
+const (
+	toNode   envelopeKind = iota // a raft message between nodes
+	toServer                     // a client request to a node
+	toClient                     // a node's answer to a client
+)
+
 type envelope struct {
-	at  int64
-	seq uint64
-	m   raft.Message
+	at   int64
+	seq  uint64
+	kind envelopeKind
+	m    raft.Message
+	req  request
+	resp response
 }
 
 type envelopes []envelope
