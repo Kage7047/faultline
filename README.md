@@ -18,6 +18,10 @@ seed 1565 replays on seed 1565, exactly, on any machine. CI and a laptop produce
 for the same seed, down to the message count. The same node runs in the real server, behind a
 write-ahead log and an HTTP transport.
 
+**Write-up:** [Every feature I added to my Raft hid a bug from my tests](https://kage7047.github.io/writing/features-hide-bugs/).
+Prebuilt binaries for Linux and macOS, with build provenance, are on the
+[releases page](https://github.com/Kage7047/faultline/releases).
+
 ## Try it
 
 ```bash
@@ -242,7 +246,7 @@ go test ./sim -run TestControlMatrix -matrix -v -timeout 60m   # every control i
 - [x] Snapshots and log compaction, InstallSnapshot, and two controls (stale snapshot, missing dedup table)
 - [x] A real server: WAL with fsync, HTTP transport and API, metrics, a local 3-node cluster you can `kill -9`
 - [x] A chaos test of real processes (`kill -9`, `SIGSTOP`) checked by Porcupine, with a control
-- [ ] A write-up of what the simulator found
+- [x] A write-up: [Every feature I added to my Raft hid a bug from my tests](https://kage7047.github.io/writing/features-hide-bugs/)
 - [ ] Membership changes (joint consensus or one server at a time) and leader transfer
 - [ ] Network partitions between real processes in the chaos test
 
