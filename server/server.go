@@ -35,6 +35,9 @@ type Config struct {
 	// SnapshotEvery: snapshot and compact after this many applied entries.
 	SnapshotEvery int
 	Log           *slog.Logger
+	// Secret, if set, authenticates raft traffic: every batch carries an HMAC-SHA256 of its body
+	// and batches without a valid one are refused. Every node needs the same secret.
+	Secret []byte
 	// Unsafe switches off raft safety rules. Only the chaos test's control sets it.
 	Unsafe raft.Unsafe
 }
@@ -56,7 +59,7 @@ type Server struct {
 	inbox   chan raft.Message
 	props   chan *proposal
 	readc   chan *read
-	statusc chan chan Status
+	statusc chan statusReq
 
 	waiters map[raft.Index]*proposal
 	readCtx uint64
@@ -80,6 +83,11 @@ func (e errNotLeader) Error() string { return fmt.Sprintf("not the leader (leade
 // request, which the session table makes safe.
 var errRetry = errors.New("retry")
 
+type statusReq struct {
+	hash bool // also hash the whole store (costly: only on request)
+	resp chan Status
+}
+
 type proposal struct {
 	cmd  kv.Command
 	term raft.Term
@@ -102,8 +110,9 @@ type Status struct {
 	Applied       raft.Index  `json:"applied"`
 	LastIndex     raft.Index  `json:"last_index"`
 	SnapshotIndex raft.Index  `json:"snapshot_index"`
-	// StateHash is a sha256 of the store's state: replicas at the same Applied must agree on it.
-	StateHash string   `json:"state_hash"`
+	// StateHash is a sha256 of the store's state, only computed for /status?hash=1: replicas
+	// at the same Applied must agree on it.
+	StateHash string   `json:"state_hash,omitempty"`
 	Counters  counters `json:"counters"`
 }
 
@@ -145,7 +154,7 @@ func New(cfg Config) (*Server, error) {
 		inbox:   make(chan raft.Message, 4096),
 		props:   make(chan *proposal),
 		readc:   make(chan *read),
-		statusc: make(chan chan Status),
+		statusc: make(chan statusReq),
 		waiters: map[raft.Index]*proposal{},
 		pending: map[uint64]*read{},
 	}
@@ -174,7 +183,7 @@ func New(cfg Config) (*Server, error) {
 		Seed:           rand.Uint64(),
 		Unsafe:         cfg.Unsafe,
 	}, hs, snap, entries, s.applied)
-	s.tr = newTransport(cfg.ID, cfg.Cluster, s.receive, s.log)
+	s.tr = newTransport(cfg.ID, cfg.Cluster, cfg.Secret, s.receive, s.log)
 	s.log.Info("started", "term", hs.Term, "commit", hs.Commit, "snapshot", snap.Index, "entries", len(entries))
 	return s, nil
 }
@@ -211,8 +220,8 @@ func (s *Server) Run(ctx context.Context) error {
 			s.propose(p)
 		case r := <-s.readc:
 			s.startRead(r)
-		case c := <-s.statusc:
-			c <- s.status()
+		case req := <-s.statusc:
+			req.resp <- s.status(req.hash)
 		}
 		if err := s.drain(); err != nil {
 			s.log.Error("storage failed, stopping", "err", err)
@@ -248,12 +257,16 @@ func (s *Server) drain() error {
 	for s.node.HasReady() {
 		rd := s.node.Ready()
 		if rd.Snapshot != nil {
+			// Decode it before anything touches the disk: a snapshot that does not decode must
+			// not be persisted, or every restart would fail on it.
+			restored := kv.New()
+			if err := restored.Restore(rd.Snapshot.Data); err != nil {
+				return fmt.Errorf("snapshot at %d from the leader does not decode: %w", rd.Snapshot.Index, err)
+			}
 			if err := s.wal.InstallSnapshot(*rd.Snapshot); err != nil {
 				return err
 			}
-			if err := s.store.Restore(rd.Snapshot.Data); err != nil {
-				return err
-			}
+			s.store = restored
 			s.applied, s.snapIndex = rd.Snapshot.Index, rd.Snapshot.Index
 			s.m.Installs++
 			s.log.Info("installed snapshot", "index", rd.Snapshot.Index)
@@ -394,11 +407,10 @@ func (s *Server) maybeCompact() error {
 	return nil
 }
 
-func (s *Server) status() Status {
-	sum := sha256.Sum256(s.store.Snapshot())
+func (s *Server) status(hash bool) Status {
 	c := s.m
 	c.Sent, c.Dropped = s.tr.sent.Load(), s.tr.dropped.Load()
-	return Status{
+	st := Status{
 		ID:            s.cfg.ID,
 		Role:          s.node.Role().String(),
 		Term:          s.node.Term(),
@@ -407,7 +419,11 @@ func (s *Server) status() Status {
 		Applied:       s.applied,
 		LastIndex:     s.node.LastIndex(),
 		SnapshotIndex: s.snapIndex,
-		StateHash:     hex.EncodeToString(sum[:8]),
 		Counters:      c,
 	}
+	if hash {
+		sum := sha256.Sum256(s.store.Snapshot())
+		st.StateHash = hex.EncodeToString(sum[:8])
+	}
+	return st
 }

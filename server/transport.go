@@ -3,7 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync/atomic"
@@ -12,11 +16,19 @@ import (
 	"github.com/Kage7047/faultline/raft"
 )
 
+// HeaderAuth carries the HMAC-SHA256 of a raft batch under the cluster secret.
+const HeaderAuth = "Faultline-Auth"
+
 // transport sends raft messages to peers over HTTP. Each peer has a queue and one goroutine that
 // posts batches. Sending never blocks the node: a full queue or a failed post drops messages,
 // and Raft recovers from loss by retrying on the next heartbeat.
+//
+// With a cluster secret, every batch is signed and unsigned batches are refused. A captured
+// batch can be replayed, but Raft already has to tolerate duplicated and delayed messages (the
+// simulator delivers 2% of messages twice and 1% very late), so a replay is just another one.
 type transport struct {
 	self    raft.NodeID
+	secret  []byte
 	peers   map[raft.NodeID]*peer
 	recv    func(raft.Message)
 	client  *http.Client
@@ -31,9 +43,11 @@ type peer struct {
 	q   chan raft.Message
 }
 
-func newTransport(self raft.NodeID, cluster map[raft.NodeID]string, recv func(raft.Message), log *slog.Logger) *transport {
+func newTransport(self raft.NodeID, cluster map[raft.NodeID]string, secret []byte, recv func(raft.Message),
+	log *slog.Logger) *transport {
 	t := &transport{
 		self:   self,
+		secret: secret,
 		peers:  map[raft.NodeID]*peer{},
 		recv:   recv,
 		client: &http.Client{Timeout: 500 * time.Millisecond},
@@ -108,6 +122,9 @@ func (t *transport) post(ctx context.Context, p *peer, batch []raft.Message) err
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if t.secret != nil {
+		req.Header.Set(HeaderAuth, t.sign(body))
+	}
 	resp, err := t.client.Do(req)
 	if err != nil {
 		return err
@@ -123,15 +140,35 @@ type httpError struct{ code int }
 
 func (e *httpError) Error() string { return http.StatusText(e.code) }
 
-// handleRaft receives a batch from a peer.
+func (t *transport) sign(body []byte) string {
+	mac := hmac.New(sha256.New, t.secret)
+	mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// handleRaft receives a batch from a peer. Only messages from cluster members to this node get
+// through; raft.Node drops anything else as well.
 func (t *transport) handleRaft(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256<<20))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if t.secret != nil {
+		got, err := hex.DecodeString(r.Header.Get(HeaderAuth))
+		want, _ := hex.DecodeString(t.sign(body))
+		if err != nil || !hmac.Equal(got, want) {
+			http.Error(w, "bad or missing "+HeaderAuth, http.StatusUnauthorized)
+			return
+		}
+	}
 	var batch []raft.Message
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<20)).Decode(&batch); err != nil {
+	if err := json.Unmarshal(body, &batch); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	for _, m := range batch {
-		if m.To == t.self {
+		if _, member := t.peers[m.From]; member && m.To == t.self {
 			t.recv(m)
 		}
 	}

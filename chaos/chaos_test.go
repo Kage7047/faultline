@@ -267,6 +267,7 @@ func (c *cluster) start(i int) {
 	args := append([]string{"-id", fmt.Sprint(i + 1), "-cluster", c.spec, "-data", filepath.Join(c.dir, fmt.Sprint(i+1)),
 		"-snapshot-every", "200"}, c.extra...)
 	cmd := exec.Command(c.bin, args...)
+	cmd.Env = append(os.Environ(), "FAULTLINE_SECRET=chaos-test-secret") // the signed transport, as deployed
 	cmd.Stdout, cmd.Stderr = logf, logf
 	if err := cmd.Start(); err != nil {
 		c.t.Fatal(err)
@@ -301,7 +302,7 @@ func (c *cluster) stopAll() {
 
 func (c *cluster) status(i int) (server.Status, error) {
 	hc := http.Client{Timeout: 300 * time.Millisecond}
-	resp, err := hc.Get("http://" + c.addrs[i] + "/status")
+	resp, err := hc.Get("http://" + c.addrs[i] + "/status?hash=1")
 	if err != nil {
 		return server.Status{}, err
 	}

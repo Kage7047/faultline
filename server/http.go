@@ -115,10 +115,10 @@ func (s *Server) call(w http.ResponseWriter, r *http.Request, submit func(contex
 	}
 }
 
-func (s *Server) currentStatus(ctx context.Context) (Status, bool) {
+func (s *Server) currentStatus(ctx context.Context, hash bool) (Status, bool) {
 	c := make(chan Status, 1)
 	select {
-	case s.statusc <- c:
+	case s.statusc <- statusReq{hash: hash, resp: c}:
 	case <-ctx.Done():
 		return Status{}, false
 	}
@@ -131,7 +131,7 @@ func (s *Server) currentStatus(ctx context.Context) (Status, bool) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	st, ok := s.currentStatus(r.Context())
+	st, ok := s.currentStatus(r.Context(), r.URL.Query().Get("hash") == "1")
 	if !ok {
 		http.Error(w, "busy", http.StatusServiceUnavailable)
 		return
@@ -142,7 +142,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // handleMetrics serves the Prometheus text format, without pulling in a client library.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	st, ok := s.currentStatus(r.Context())
+	st, ok := s.currentStatus(r.Context(), false)
 	if !ok {
 		http.Error(w, "busy", http.StatusServiceUnavailable)
 		return

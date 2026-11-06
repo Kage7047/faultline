@@ -177,6 +177,18 @@ place and the directory fsynced; the log is then rewritten without the entries t
 covers. A crash between those two steps leaves a new snapshot and an old log, and replay skips
 what the snapshot covers (`TestCrashBetweenSnapshotAndLogRewrite`).
 
+## Security
+
+Raft traffic can be authenticated with a cluster secret (`FAULTLINE_SECRET` or `-secret-file`):
+every batch carries an HMAC-SHA256 of its body, and unsigned or wrongly signed batches get a
+`401`. The chaos test runs with it on. Messages from nodes outside the membership are dropped
+by the transport and again by `raft.Node.Step`, so they never count towards a quorum. Replay is
+not prevented, on purpose: Raft already has to survive duplicated and delayed messages, which
+is what a replay is, and the simulator tests exactly that. A snapshot from the leader is
+decoded before it is written to disk, so a bad one stops the node instead of poisoning every
+restart. Not done: TLS (the HMAC authenticates but does not encrypt) and any authentication on
+the client API. Keep both ports on a private network, or put a proxy in front.
+
 ## Layout
 
 ```

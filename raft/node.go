@@ -176,8 +176,12 @@ func (n *Node) Compact(index Index, data []byte) error {
 	return nil
 }
 
-// Step processes one message from a peer.
+// Step processes one message from a peer. Messages from nodes outside the membership, or not
+// addressed to this node, are ignored, so they can never count towards a quorum.
 func (n *Node) Step(m Message) {
+	if m.To != n.id || m.From == n.id || !slices.Contains(n.peers, m.From) {
+		return
+	}
 	switch {
 	case m.Term > n.term:
 		if (m.Type == MsgVote || m.Type == MsgPreVote) && n.inLease() {

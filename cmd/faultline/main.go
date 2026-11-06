@@ -31,6 +31,8 @@ func main() {
 	data := flag.String("data", "", "data directory (default data/<id>)")
 	tick := flag.Duration("tick", 10*time.Millisecond, "raft tick")
 	snapEvery := flag.Int("snapshot-every", 1000, "snapshot after this many applied entries")
+	secretFile := flag.String("secret-file", "",
+		"file holding the cluster secret that authenticates raft traffic (default $FAULTLINE_SECRET)")
 	unsafeReads := flag.Bool("unsafe-read-without-quorum", false,
 		"CONTROL ONLY: answer reads without confirming leadership (serves stale reads)")
 	flag.Parse()
@@ -47,6 +49,19 @@ func main() {
 	if *data == "" {
 		*data = fmt.Sprintf("data/%d", *id)
 	}
+	secret := []byte(os.Getenv("FAULTLINE_SECRET"))
+	if *secretFile != "" {
+		b, err := os.ReadFile(*secretFile)
+		if err != nil {
+			log.Error("read secret", "err", err)
+			os.Exit(1)
+		}
+		secret = []byte(strings.TrimSpace(string(b)))
+	}
+	if len(secret) == 0 {
+		secret = nil
+		log.Warn("no cluster secret: anyone who can reach this port can send raft messages")
+	}
 	if *unsafeReads {
 		log.Warn("UNSAFE: reads are answered without confirming leadership")
 	}
@@ -57,6 +72,7 @@ func main() {
 		Tick:          *tick,
 		SnapshotEvery: *snapEvery,
 		Log:           log,
+		Secret:        secret,
 		Unsafe:        raft.Unsafe{ReadWithoutQuorum: *unsafeReads},
 	})
 	if err != nil {
