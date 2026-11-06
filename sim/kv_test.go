@@ -60,16 +60,79 @@ func TestControlNoDedupIsCaught(t *testing.T) {
 	requireCaughtKV(t, func(c *Config) { c.UnsafeNoDedup = true })
 }
 
-// A leader answering reads from local state is only wrong while it is a stale leader: cut off
-// from the majority, which has elected someone else and moved on. CheckQuorum makes such a leader
-// step down within one or two election timeouts, which shrinks that window so much that 200
-// seeds did not hit it. It is still a bug (the window is never zero), so the control runs with
-// CheckQuorum off, where the window is wide open.
-func TestControlLeaderLocalReadsIsCaught(t *testing.T) {
+// A leader answering a read without the heartbeat round is only wrong while it is a stale leader:
+// cut off from the majority, which has elected someone else and moved on. CheckQuorum makes such
+// a leader step down within one or two election timeouts, which shrinks that window so much that
+// 200 seeds did not hit it. It is still a bug (the window is never zero), so the control runs
+// with CheckQuorum off, where the window is wide open.
+func TestControlReadWithoutQuorumIsCaught(t *testing.T) {
 	requireCaughtKV(t, func(c *Config) {
 		classic(c)
-		c.UnsafeLeaderLocalReads = true
+		c.Raft.Unsafe.ReadWithoutQuorum = true
 	})
+}
+
+// A new leader's commit index can lag what the old leader already acknowledged to a client.
+// Reading at that index before the new leader's no-op commits returns a value from before a
+// completed write. The heartbeat round that confirms the read usually carries the no-op too, so
+// the commit index catches up in the same step and the read comes out fresh: 200 seeds missed it
+// in both modes. With one entry per message a lagging follower can confirm the read before it
+// has the no-op, and the stale read shows up.
+func TestControlReadBeforeTermCommitIsCaught(t *testing.T) {
+	requireCaughtKV(t, func(c *Config) {
+		classic(c)
+		c.Raft.Unsafe.ReadBeforeTermCommit = true
+		c.Raft.MaxEntriesPerMsg = 1
+	})
+}
+
+// The setting that opens the window must be safe with the rule on, or the control proves nothing.
+func TestOneEntryPerMessageIsLinearizable(t *testing.T) {
+	n := uint64(100)
+	if testing.Short() {
+		n = 15
+	}
+	parallel(1, n, func(seed uint64) {
+		cfg := KVDefaults(seed)
+		classic(&cfg)
+		cfg.Raft.MaxEntriesPerMsg = 1
+		if r := Run(cfg); r.Violation != "" || r.Inconclusive {
+			t.Errorf("seed %d: inconclusive=%v %s", seed, r.Inconclusive, r)
+		}
+	})
+}
+
+// TestReadIndexSavesLogWrites runs the same seeds with gets through the log and through
+// ReadIndex. Both must be linearizable; ReadIndex should need far fewer log entries per operation.
+func TestReadIndexSavesLogWrites(t *testing.T) {
+	n := uint64(50)
+	if testing.Short() {
+		n = 10
+	}
+	run := func(throughLog bool) (ops, entries, reads int) {
+		var mu sync.Mutex
+		parallel(1, n, func(seed uint64) {
+			cfg := KVDefaults(seed)
+			cfg.ReadsThroughLog = throughLog
+			r := Run(cfg)
+			mu.Lock()
+			defer mu.Unlock()
+			if r.Violation != "" || r.Inconclusive {
+				t.Errorf("throughLog=%v seed %d: inconclusive=%v %s", throughLog, seed, r.Inconclusive, r)
+			}
+			ops += r.Stats.Ops
+			entries += int(r.Stats.Committed)
+			reads += r.Stats.Reads
+		})
+		return
+	}
+	logOps, logEntries, _ := run(true)
+	riOps, riEntries, riReads := run(false)
+	before, after := float64(logEntries)/float64(logOps), float64(riEntries)/float64(riOps)
+	t.Logf("%d seeds: log entries per op %.2f -> %.2f (%d of %d ops were ReadIndex reads)", n, before, after, riReads, riOps)
+	if after >= before {
+		t.Errorf("ReadIndex did not reduce log entries per operation: %.2f -> %.2f", before, after)
+	}
 }
 
 func requireCaughtKV(t *testing.T, mutate func(*Config)) {

@@ -95,6 +95,10 @@ type Message struct {
 	MatchIndex    Index
 	ConflictTerm  Term
 	ConflictIndex Index
+
+	// ReadSeq rides on every MsgApp and is echoed by its response (success or not). A response
+	// carrying ReadSeq s proves the follower still accepted this leader after read s was asked.
+	ReadSeq uint64
 }
 
 func (m Message) String() string {
@@ -125,20 +129,29 @@ type SoftState struct {
 	Lead NodeID
 }
 
+// ReadState answers a ReadIndex call: once the state machine has applied Index, a read made from
+// it is linearizable (it reflects every write that completed before ReadIndex was called).
+type ReadState struct {
+	Index Index
+	Ctx   uint64
+}
+
 // Ready is everything a Node produced since the last Advance. The caller must, in order:
 //  1. persist HardState (if MustSync) and Entries (overwriting any stored entries at or after
 //     Entries[0].Index, which may have been truncated),
 //  2. send Messages,
 //  3. apply Committed to the state machine,
+//  4. serve each ReadState once the state machine has applied its Index,
 //
 // then call Advance.
 type Ready struct {
-	SoftState SoftState
-	HardState HardState
-	MustSync  bool
-	Entries   []Entry
-	Messages  []Message
-	Committed []Entry
+	SoftState  SoftState
+	HardState  HardState
+	MustSync   bool
+	Entries    []Entry
+	Messages   []Message
+	Committed  []Entry
+	ReadStates []ReadState
 }
 
 // Config sets a node's identity and timing. Timeouts are in ticks.
@@ -176,6 +189,12 @@ type Unsafe struct {
 	// CommitOldTerms lets a leader commit entries from earlier terms by counting replicas
 	// (the bug in Figure 8 of the Raft paper).
 	CommitOldTerms bool
+	// ReadWithoutQuorum answers ReadIndex at once, without the heartbeat round that proves this
+	// node still leads. A leader cut off from the majority then serves stale reads.
+	ReadWithoutQuorum bool
+	// ReadBeforeTermCommit answers ReadIndex before the leader has committed an entry of its own
+	// term. Its commit index may then lag writes the previous leader already acknowledged.
+	ReadBeforeTermCommit bool
 }
 
 func (c *Config) setDefaults() {

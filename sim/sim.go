@@ -40,10 +40,11 @@ type Config struct {
 	Keys          int
 	ClientTimeout int64
 	CheckTimeout  int64 // ms the linearizability checker may take before giving up (inconclusive)
-	// Unsafe key-value switches for the controls.
-	UnsafeNoDedup          bool   // apply retried writes again
-	UnsafeLeaderLocalReads bool   // a leader answers reads from local state without confirming it still leads
-	VisualizePath          string // write Porcupine's HTML view of a non-linearizable history here
+	// ReadsThroughLog sends gets through the log like writes, instead of ReadIndex. Only for
+	// comparing the two.
+	ReadsThroughLog bool
+	UnsafeNoDedup   bool   // a control: apply retried writes again
+	VisualizePath   string // write Porcupine's HTML view of a non-linearizable history here
 
 	TraceLen      int  // how many recent events to keep for a failure report
 	TraceMessages bool // also record every delivered message (verbose; for debugging a seed)
@@ -92,6 +93,7 @@ type Stats struct {
 	Duplicated  int
 	FinalCommit []raft.Index // per node, at the end
 
+	Reads   int // gets answered through ReadIndex, without a log entry
 	Ops     int // client operations that completed
 	Retries int // client resends after a timeout or a "not leader" answer
 }
@@ -135,7 +137,11 @@ type node struct {
 	wasLeader raft.Term
 
 	store   *kv.Store
+	applied raft.Index            // last index the store has applied
 	waiters map[raft.Index]waiter // client requests this node proposed, by log index
+	readCtx uint64                // last ReadIndex ctx handed out
+	reads   map[uint64]pendingGet // gets waiting for their ReadState, by ctx
+	ready   []pendingGet          // gets with a read index, waiting for the store to apply it
 }
 
 // Sim is one run in progress.
@@ -213,7 +219,10 @@ func (s *Sim) start(n *node) {
 	n.r = raft.NewNode(c, n.disk.hs, n.disk.entries, 0)
 	n.store = kv.New()
 	n.store.UnsafeNoDedup = s.cfg.UnsafeNoDedup
+	n.applied = 0
 	n.waiters = map[raft.Index]waiter{}
+	n.reads = map[uint64]pendingGet{}
+	n.ready = nil
 	s.check.restarted(n.id)
 }
 
@@ -296,10 +305,19 @@ func (s *Sim) process(n *node) {
 		s.stats.MaxTerm = max(s.stats.MaxTerm, rd.HardState.Term)
 		for _, e := range rd.Committed {
 			s.fail(s.check.apply(n.id, e))
+			n.applied = e.Index
 			if s.cfg.Clients > 0 && e.Data != nil {
 				s.applyCommand(n, e)
 			}
 		}
+		for _, rs := range rd.ReadStates {
+			if g, ok := n.reads[rs.Ctx]; ok {
+				delete(n.reads, rs.Ctx)
+				g.index = rs.Index
+				n.ready = append(n.ready, g)
+			}
+		}
+		s.serveReads(n)
 		n.r.Advance(rd)
 	}
 }

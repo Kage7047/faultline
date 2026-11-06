@@ -273,3 +273,101 @@ func TestCheckQuorumLeaderStepsDownWhenCutOff(t *testing.T) {
 		t.Fatal("a leader cut off from every follower still believes it leads")
 	}
 }
+
+// reads drains every node's Ready and returns the ReadStates node id produced.
+func (c *cluster) reads(id NodeID) []ReadState {
+	var out []ReadState
+	for range 10_000 {
+		var pending []Message
+		for nid := NodeID(1); int(nid) <= len(c.nodes); nid++ {
+			n := c.nodes[nid]
+			for n.HasReady() {
+				rd := n.Ready()
+				pending = append(pending, rd.Messages...)
+				if nid == id {
+					out = append(out, rd.ReadStates...)
+				}
+				n.Advance(rd)
+			}
+		}
+		if len(pending) == 0 {
+			return out
+		}
+		for _, m := range pending {
+			if !c.drop(m) {
+				c.nodes[m.To].Step(m)
+			}
+		}
+	}
+	c.t.Fatal("cluster did not settle")
+	return nil
+}
+
+func TestReadIndexConfirmsLeadership(t *testing.T) {
+	c := newCluster(t, 3)
+	c.elect(1)
+	idx := c.propose(1, "x")
+	lastBefore := c.nodes[1].LastIndex()
+	if err := c.nodes[1].ReadIndex(7); err != nil {
+		t.Fatal(err)
+	}
+	got := c.reads(1)
+	if len(got) != 1 || got[0].Ctx != 7 || got[0].Index != idx {
+		t.Fatalf("read states %v, want one with ctx 7 at index %d", got, idx)
+	}
+	if c.nodes[1].LastIndex() != lastBefore {
+		t.Fatal("a ReadIndex read wrote to the log")
+	}
+	if err := c.nodes[2].ReadIndex(8); err != ErrNotLeader {
+		t.Fatalf("follower: err = %v, want ErrNotLeader", err)
+	}
+}
+
+func TestReadIndexNeedsMajority(t *testing.T) {
+	c := newCluster(t, 3)
+	c.elect(1)
+	c.drop = func(m Message) bool { return m.From == 1 || m.To == 1 }
+	if err := c.nodes[1].ReadIndex(1); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.reads(1); len(got) != 0 {
+		t.Fatalf("a leader cut off from every follower answered a read: %v", got)
+	}
+	// one follower answering is a majority of three
+	c.drop = func(m Message) bool { return m.From == 3 || m.To == 3 }
+	c.nodes[1].Tick()
+	if got := c.reads(1); len(got) != 1 || got[0].Ctx != 1 {
+		t.Fatalf("read states %v after a majority answered", got)
+	}
+}
+
+func TestReadIndexWaitsForTermCommit(t *testing.T) {
+	c := newCluster(t, 3)
+	c.drop = func(m Message) bool { return m.Type == MsgAppResp } // the no-op never commits
+	c.elect(1)
+	if err := c.nodes[1].ReadIndex(1); err != ErrReadNotReady {
+		t.Fatalf("err = %v, want ErrReadNotReady", err)
+	}
+	c.drop = func(Message) bool { return false }
+	c.nodes[1].Tick()
+	c.settle()
+	if err := c.nodes[1].ReadIndex(1); err != nil {
+		t.Fatalf("after the no-op committed: %v", err)
+	}
+}
+
+func TestReadsDroppedOnStepDown(t *testing.T) {
+	c := newCluster(t, 3)
+	c.elect(1)
+	c.drop = func(m Message) bool { return m.From == 1 || m.To == 1 }
+	if err := c.nodes[1].ReadIndex(1); err != nil {
+		t.Fatal(err)
+	}
+	c.reads(1)
+	c.elect(2)
+	c.drop = func(Message) bool { return false }
+	c.nodes[1].Tick() // hears the new term and steps down
+	if got := c.reads(1); len(got) != 0 {
+		t.Fatalf("a deposed leader answered a read: %v", got)
+	}
+}

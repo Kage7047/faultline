@@ -1,10 +1,13 @@
 // Package kv is the replicated state machine: a string key-value store with client sessions.
 //
-// Every command goes through the Raft log, reads included, so a read reflects every write that
-// completed before it started (linearizability). Each command carries (client, seq). The store
-// remembers the last seq and result per client, so a command retried after a timeout or a leader
-// change is applied once and answered with the original result: exactly-once effects, the same
-// idea as an idempotency key, kept inside the replicated state so every replica agrees on it.
+// Writes go through the Raft log. Reads are served from local state after a ReadIndex round
+// (see raft.Node.ReadIndex), or through the log too if the caller prefers; either way a read
+// reflects every write that completed before it started (linearizability).
+//
+// Each command carries (client, seq). The store remembers the last seq and result per client,
+// so a command retried after a timeout or a leader change is applied once and answered with the
+// original result: exactly-once effects, the same idea as an idempotency key, kept inside the
+// replicated state so every replica agrees on it.
 package kv
 
 import (
@@ -103,6 +106,5 @@ func (s *Store) Apply(c Command) Result {
 }
 
 // Read returns a key's value from this replica's local state, without going through the log.
-// It is only linearizable if the caller knows this replica is up to date; the store uses it for
-// the unsafe-local-reads control and for debugging.
+// It is linearizable only after a ReadIndex round, once the store has applied the read index.
 func (s *Store) Read(key string) string { return s.data[key] }

@@ -51,6 +51,15 @@ type waiter struct {
 	term   raft.Term
 }
 
+// pendingGet is a get served by ReadIndex: first waiting for leadership to be confirmed, then for
+// the store to catch up with the read index.
+type pendingGet struct {
+	client int
+	seq    uint64
+	key    string
+	index  raft.Index
+}
+
 // historyOp is one completed (or, at the end, still pending) client operation.
 type historyOp struct {
 	client      int
@@ -120,10 +129,14 @@ func (s *Sim) serve(req request) {
 		s.reply(no)
 		return
 	}
-	if req.cmd.Op == kv.Get && s.cfg.UnsafeLeaderLocalReads {
-		// The bug: a leader that has been partitioned away still believes it leads and answers
-		// from its own state, which the majority may have moved past.
-		s.reply(response{client: req.client, seq: req.cmd.Seq, ok: true, value: n.store.Read(req.cmd.Key)})
+	if req.cmd.Op == kv.Get && !s.cfg.ReadsThroughLog {
+		n.readCtx++
+		if err := n.r.ReadIndex(n.readCtx); err != nil {
+			s.reply(no) // not leader, or a new leader not ready yet: the client backs off and retries
+			return
+		}
+		n.reads[n.readCtx] = pendingGet{client: req.client, seq: req.cmd.Seq, key: req.cmd.Key}
+		s.process(n)
 		return
 	}
 	idx, term, err := n.r.Propose(req.cmd.Encode())
@@ -157,6 +170,20 @@ func (s *Sim) applyCommand(n *node, e raft.Entry) {
 		// Someone else's entry won this index: our proposal was lost with a leadership change.
 		s.reply(response{client: w.client, seq: w.seq, hint: n.r.Leader()})
 	}
+}
+
+// serveReads answers the gets whose read index the store has reached.
+func (s *Sim) serveReads(n *node) {
+	keep := n.ready[:0]
+	for _, g := range n.ready {
+		if g.index > n.applied {
+			keep = append(keep, g)
+			continue
+		}
+		s.stats.Reads++
+		s.reply(response{client: g.client, seq: g.seq, ok: true, value: n.store.Read(g.key)})
+	}
+	n.ready = keep
 }
 
 func (s *Sim) clientReceive(r response) {
