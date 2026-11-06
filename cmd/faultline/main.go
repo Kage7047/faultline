@@ -45,7 +45,6 @@ func main() {
 		return
 	}
 
-
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	members, err := parseCluster(*cluster)
 	if err != nil || *id == 0 {
