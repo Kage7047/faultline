@@ -33,6 +33,7 @@ type transport struct {
 	recv    func(raft.Message)
 	client  *http.Client
 	log     *slog.Logger
+	inbound chan struct{} // bounds concurrent /raft requests; each peer sends one at a time
 	sent    atomic.Int64
 	dropped atomic.Int64
 }
@@ -46,12 +47,13 @@ type peer struct {
 func newTransport(self raft.NodeID, cluster map[raft.NodeID]string, secret []byte, recv func(raft.Message),
 	log *slog.Logger) *transport {
 	t := &transport{
-		self:   self,
-		secret: secret,
-		peers:  map[raft.NodeID]*peer{},
-		recv:   recv,
-		client: &http.Client{Timeout: 500 * time.Millisecond},
-		log:    log,
+		self:    self,
+		secret:  secret,
+		inbound: make(chan struct{}, 2*len(cluster)),
+		peers:   map[raft.NodeID]*peer{},
+		recv:    recv,
+		client:  &http.Client{Timeout: 500 * time.Millisecond},
+		log:     log,
 	}
 	for id, addr := range cluster {
 		if id != self {
@@ -149,15 +151,31 @@ func (t *transport) sign(body []byte) string {
 // handleRaft receives a batch from a peer. Only messages from cluster members to this node get
 // through; raft.Node drops anything else as well.
 func (t *transport) handleRaft(w http.ResponseWriter, r *http.Request) {
+	select {
+	case t.inbound <- struct{}{}:
+		defer func() { <-t.inbound }()
+	default:
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+		return
+	}
+	// Refuse an unsigned request before reading its body.
+	var got []byte
+	if t.secret != nil {
+		var err error
+		got, err = hex.DecodeString(r.Header.Get(HeaderAuth))
+		if err != nil || len(got) != sha256.Size {
+			http.Error(w, "bad or missing "+HeaderAuth, http.StatusUnauthorized)
+			return
+		}
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256<<20))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if t.secret != nil {
-		got, err := hex.DecodeString(r.Header.Get(HeaderAuth))
 		want, _ := hex.DecodeString(t.sign(body))
-		if err != nil || !hmac.Equal(got, want) {
+		if !hmac.Equal(got, want) {
 			http.Error(w, "bad or missing "+HeaderAuth, http.StatusUnauthorized)
 			return
 		}
