@@ -102,6 +102,19 @@ in production. With them on, the Figure 8 control survived 2,000 seeds and the s
 compaction on, the Figure 8 control survived all 2,000 seeds, because a lagging follower now
 catches up with one snapshot instead of entry by entry. The bugs are still there, so every safety
 test runs in all three modes, and each control runs in the mode where its window is open.
+`TestControlMatrix` (`-matrix`, about 15 minutes) runs every control in every mode:
+
+| rule switched off | everything on | classic | bare |
+|---|---|---|---|
+| vote for any candidate | seed 1 | seed 1 | seed 1 |
+| commit old-term entries (one entry per message) | **missed in 2,000** | **missed in 2,000** | seed 1,565 |
+| install a stale snapshot | seed 1 | seed 1 | n/a |
+| no dedup of retried writes | seed 1 | seed 1 | seed 1 |
+| snapshot without the dedup table | seed 30 | seed 4 | n/a |
+| read without the quorum round | **missed in 200** | seed 1 | seed 3 |
+| read before the term's first commit (one entry per message) | seed 11 | seed 2 | seed 39 |
+
+No single mode catches all seven, and the one you would deploy misses two.
 
 **A bug hidden by the code next to it.** A new leader does not know the cluster's commit index
 until its own no-op commits; answering a read before then can miss a write the old leader already
@@ -212,6 +225,7 @@ go test ./sim -run TestSafety -seeds 5000 -v   # more seeds
 go test ./sim -run TestSafety -seed 1565 -v    # replay one seed
 go test -race -short ./...
 go test ./chaos -chaos -v                      # the real-process chaos test (~2 min)
+go test ./sim -run TestControlMatrix -matrix -v -timeout 60m   # every control in every mode
 ```
 
 ## Roadmap
