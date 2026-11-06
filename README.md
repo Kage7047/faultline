@@ -4,19 +4,40 @@
 ![go](https://img.shields.io/badge/go-1.27-00ADD8)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-Raft consensus and a replicated key-value store in Go, built to be tested by a deterministic
-simulator. **Work in progress**: consensus, the store, linearizability checking, PreVote,
-CheckQuorum, ReadIndex reads and snapshots are done; a real networked server is next (see
-[Roadmap](#roadmap)).
+Raft consensus and a replicated key-value store in Go, tested two ways: by a deterministic
+simulator that runs hundreds of hostile 30-second clusters per minute, and by a chaos test that
+`kill -9`s and freezes real processes while clients use them. Both feed every client history to
+the [Porcupine](https://github.com/anishathalye/porcupine) linearizability checker, and both have
+controls: deliberately broken builds that the checks must catch.
 
 The Raft node is a pure state machine. It does no I/O, starts no goroutines and reads no clock:
 the caller feeds it ticks and messages and collects what to persist, send and apply. That lets the
 same code run under a simulator where **one seed decides everything**: message latency, loss,
 duplication, reordering, partitions, crashes, restarts and election timeouts. A failure found on
 seed 1565 replays on seed 1565, exactly, on any machine. CI and a laptop produce the same numbers
-for the same seed, down to the message count.
+for the same seed, down to the message count. The same node runs in the real server, behind a
+write-ahead log and an HTTP transport.
 
-## What gets checked
+## Try it
+
+```bash
+scripts/cluster.sh up                                   # nodes 1-3 on ports 7001-7003
+curl -L -X PUT --data-binary hello localhost:7001/kv/greeting
+curl -L -X POST --data-binary ' world' 'localhost:7002/kv/greeting?op=append'
+curl -L localhost:7003/kv/greeting                      # hello world
+scripts/cluster.sh status                               # who leads, terms, commit indexes
+scripts/cluster.sh kill9 2                              # kill whichever node leads
+curl -L localhost:7001/kv/greeting                      # a new leader answers
+scripts/cluster.sh start 2                              # it recovers from its WAL and catches up
+curl localhost:7001/metrics                             # Prometheus text format
+scripts/cluster.sh down
+```
+
+Followers answer with a `307` to the leader (`-L` follows it). Writes sent with
+`Faultline-Client` and `Faultline-Seq` headers are applied exactly once however often they are
+retried; the Go client in `client/` does that for you.
+
+## What the simulator checks
 
 The simulated cluster has 5 nodes. Messages take 1 to 30 ms (1% of them ten times longer, so they
 arrive after newer ones), 5% are lost and 2% duplicated, a node crashes about every 1.7 s and the
@@ -118,13 +139,57 @@ committed is ignored. The store's snapshot holds the data and the session table,
 the table a restored replica would apply a retried write twice. That was a classic bug in MIT's
 6.824 labs, and the control above catches it.
 
+## The chaos test: real processes
+
+`go test ./chaos -chaos` builds the binary, starts three nodes (separate processes, real fsync,
+real TCP on localhost) with five clients on them, and for 60 seconds every 0.5 to 2 seconds
+either `kill -9`s a node (half the time the leader) and restarts it, or freezes the leader with
+`SIGSTOP` for up to 1.6 s and wakes it with `SIGCONT`, still believing it leads. Then it waits
+until every replica has applied the same index and holds the same state hash, and checks the
+history with the same Porcupine model the simulator uses. It runs in CI on every push.
+
+| run | client ops | `kill -9` | leader freezes | highest term | snapshots installed | violations |
+|---|---:|---:|---:|---:|---:|---:|
+| `TestKill9`, 60 s | 8,979 | 15 | 13 | 18 | 4 | **0** |
+| `TestControlStaleReads`, 30 s, reads skip the quorum check | 4,451 | 0 | 15 | 16 | 2 | **caught** |
+
+**The first version of the control passed, and that was the test's bug.** Every client waited
+2 s per attempt, longer than any freeze, so while the leader was frozen all five clients were
+stuck waiting on it, nobody wrote, and there was nothing stale to read when it woke up. Now three
+clients give up after 250 ms and write through the new leader, and two keep waiting on the old
+one, then send it their next read the moment it wakes, before it hears about the new term.
+With that mix the broken build failed in all five runs so far, and the correct one passes.
+
+What this does not test: `kill -9` kills the process, not the machine, so data the process wrote
+is still in the OS page cache and survives without fsync. Power loss is covered at the file
+level instead: the WAL tests cut the log at every byte offset of the last write and flip bits in
+it, and every cut must reopen to a consistent state. Network partitions between real processes
+(iptables or network namespaces) are not covered yet; the simulator covers them.
+
+## Storage
+
+Each node keeps a write-ahead log and a snapshot file (`wal/`). A log record is length, CRC-32C,
+type and payload. A batch of hard state and entries is one write and one fsync, and the node
+sends nothing that depends on it until that returns. On startup, the first record that is short
+or fails its checksum is treated as a torn tail and cut off (and reported in
+`faultline_wal_repaired_bytes`). Snapshots are written to a temporary file, fsynced, renamed into
+place and the directory fsynced; the log is then rewritten without the entries the snapshot
+covers. A crash between those two steps leaves a new snapshot and an old log, and replay skips
+what the snapshot covers (`TestCrashBetweenSnapshotAndLogRewrite`).
+
 ## Layout
 
 ```
-raft/   the consensus algorithm: elections, replication, commit, PreVote, CheckQuorum, ReadIndex,
-        snapshots, restart
-kv/     the replicated state machine: get/put/append with client sessions (exactly-once retries), snapshots
-sim/    the deterministic simulator, fault model, clients, safety checker and Porcupine model
+raft/          the consensus algorithm: elections, replication, commit, PreVote, CheckQuorum,
+               ReadIndex, snapshots, restart. No I/O.
+kv/            the replicated state machine: get/put/append with client sessions (exactly-once
+               retries), snapshots, and the Porcupine model of what correct means
+sim/           the deterministic simulator, fault model, clients and safety checker
+wal/           durable storage: CRC'd write-ahead log, torn-tail repair, atomic snapshots
+server/        one node over a real network: the node loop, HTTP transport, client API, metrics
+client/        a Go client that follows the leader and retries writes exactly once
+cmd/faultline/ the binary
+chaos/         the real-process chaos test
 ```
 
 ## Running it
@@ -134,6 +199,7 @@ go test ./...                                  # everything, three modes, the co
 go test ./sim -run TestSafety -seeds 5000 -v   # more seeds
 go test ./sim -run TestSafety -seed 1565 -v    # replay one seed
 go test -race -short ./...
+go test ./chaos -chaos -v                      # the real-process chaos test (~2 min)
 ```
 
 ## Roadmap
@@ -146,8 +212,11 @@ go test -race -short ./...
 - [x] PreVote and CheckQuorum, and a test showing why: a node back from a partition deposing a healthy leader
 - [x] ReadIndex reads (linearizable without a log write), with controls for both of its rules
 - [x] Snapshots and log compaction, InstallSnapshot, and two controls (stale snapshot, missing dedup table)
-- [ ] A real server: networked transport, an HTTP API, a local 3-node cluster you can `kill -9`
+- [x] A real server: WAL with fsync, HTTP transport and API, metrics, a local 3-node cluster you can `kill -9`
+- [x] A chaos test of real processes (`kill -9`, `SIGSTOP`) checked by Porcupine, with a control
 - [ ] A write-up of what the simulator found
+- [ ] Membership changes (joint consensus or one server at a time) and leader transfer
+- [ ] Network partitions between real processes in the chaos test
 
 ## License
 

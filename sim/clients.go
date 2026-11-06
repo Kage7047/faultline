@@ -210,67 +210,11 @@ func (s *Sim) clientReceive(r response) {
 
 // ---- linearizability --------------------------------------------------------------------------
 
-type kvInput struct {
-	op    kv.Op
-	key   string
-	value string
-}
-
-type kvOutput struct {
-	value string
-	known bool // false for a write still in flight at the end: it may or may not have happened
-}
-
-// kvModel is a single-copy key-value register per key. Writes return the value after them, so the
-// model checks those too: a retried append that was applied twice shows up as a wrong output.
-var kvModel = porcupine.Model{
-	Partition: func(history []porcupine.Operation) [][]porcupine.Operation {
-		byKey := map[string][]porcupine.Operation{}
-		var keys []string
-		for _, op := range history {
-			k := op.Input.(kvInput).key
-			if _, ok := byKey[k]; !ok {
-				keys = append(keys, k)
-			}
-			byKey[k] = append(byKey[k], op)
-		}
-		out := make([][]porcupine.Operation, 0, len(keys))
-		for _, k := range keys {
-			out = append(out, byKey[k])
-		}
-		return out
-	},
-	Init: func() any { return "" },
-	Step: func(state, input, output any) (bool, any) {
-		st, in, out := state.(string), input.(kvInput), output.(kvOutput)
-		next := st
-		switch in.op {
-		case kv.Put:
-			next = in.value
-		case kv.Append:
-			next = st + in.value
-		}
-		return !out.known || out.value == next, next
-	},
-	DescribeOperation: func(input, output any) string {
-		in, out := input.(kvInput), output.(kvOutput)
-		res := "?"
-		if out.known {
-			res = fmt.Sprintf("%q", out.value)
-		}
-		if in.op == kv.Get {
-			return fmt.Sprintf("get(%s) -> %s", in.key, res)
-		}
-		return fmt.Sprintf("%s(%s, %q) -> %s", in.op, in.key, in.value, res)
-	},
-	DescribeState: func(state any) string { return fmt.Sprintf("%q", state) },
-}
-
 func (s *Sim) checkLinearizable() {
 	ops := make([]porcupine.Operation, 0, len(s.history)+len(s.clients))
 	for _, h := range s.history {
 		ops = append(ops, porcupine.Operation{ClientId: h.client, Call: h.call, Return: h.ret,
-			Input: kvInput{h.cmd.Op, h.cmd.Key, h.cmd.Value}, Output: kvOutput{h.output, true}})
+			Input: kv.Input{Op: h.cmd.Op, Key: h.cmd.Key, Value: h.cmd.Value}, Output: kv.Output{Value: h.output, Known: true}})
 	}
 	// A write still in flight may have been applied or not; it may take effect any time after it
 	// started. A read in flight has no effect, so it is left out.
@@ -278,14 +222,14 @@ func (s *Sim) checkLinearizable() {
 		if c.cur != nil && c.cur.cmd.Op != kv.Get {
 			cmd := c.cur.cmd
 			ops = append(ops, porcupine.Operation{ClientId: c.id, Call: c.cur.start, Return: math.MaxInt64,
-				Input: kvInput{cmd.Op, cmd.Key, cmd.Value}, Output: kvOutput{}})
+				Input: kv.Input{Op: cmd.Op, Key: cmd.Key, Value: cmd.Value}, Output: kv.Output{}})
 		}
 	}
-	res, info := porcupine.CheckOperationsVerbose(kvModel, ops, time.Duration(s.cfg.CheckTimeout)*time.Millisecond)
+	res, info := porcupine.CheckOperationsVerbose(kv.Model, ops, time.Duration(s.cfg.CheckTimeout)*time.Millisecond)
 	switch res {
 	case porcupine.Illegal:
 		msg := fmt.Sprintf("not linearizable: %d operations by %d clients have no valid single-copy order", len(ops), len(s.clients))
-		if s.cfg.VisualizePath != "" && porcupine.VisualizePath(kvModel, info, s.cfg.VisualizePath) == nil {
+		if s.cfg.VisualizePath != "" && porcupine.VisualizePath(kv.Model, info, s.cfg.VisualizePath) == nil {
 			msg += " (see " + s.cfg.VisualizePath + ")"
 		}
 		s.fail(msg)
