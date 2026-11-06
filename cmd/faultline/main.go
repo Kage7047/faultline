@@ -25,7 +25,11 @@ import (
 	"github.com/Kage7047/faultline/server"
 )
 
+// version is set at release build time with -ldflags "-X main.version=v0.1.0".
+var version = "dev"
+
 func main() {
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	id := flag.Uint64("id", 0, "this node's id")
 	cluster := flag.String("cluster", "", "every node as id=host:port, comma separated")
 	data := flag.String("data", "", "data directory (default data/<id>)")
@@ -36,6 +40,11 @@ func main() {
 	unsafeReads := flag.Bool("unsafe-read-without-quorum", false,
 		"CONTROL ONLY: answer reads without confirming leadership (serves stale reads)")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("faultline", version)
+		return
+	}
+
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	members, err := parseCluster(*cluster)
