@@ -371,3 +371,98 @@ func TestReadsDroppedOnStepDown(t *testing.T) {
 		t.Fatalf("a deposed leader answered a read: %v", got)
 	}
 }
+
+// compactAll snapshots every node at its applied index.
+func (c *cluster) compactAll() {
+	for _, n := range c.nodes {
+		if n.applied > n.log.snapIndex {
+			if err := n.Compact(n.applied, []byte(fmt.Sprintf("state@%d", n.applied))); err != nil {
+				c.t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestLaggingFollowerGetsSnapshot(t *testing.T) {
+	c := newCluster(t, 3)
+	c.elect(1)
+	c.drop = func(m Message) bool { return m.From == 3 || m.To == 3 }
+	for i := range 10 {
+		c.propose(1, fmt.Sprint(i))
+	}
+	c.compactAll()
+	if err := c.nodes[1].Compact(c.nodes[1].log.snapIndex, nil); err != ErrCompacted {
+		t.Fatalf("compacting twice at the same index: err = %v", err)
+	}
+	var installed *Snapshot
+	c.drop = func(Message) bool { return false }
+	c.nodes[1].Tick()
+	for range 100 {
+		for id := NodeID(1); id <= 3; id++ {
+			n := c.nodes[id]
+			for n.HasReady() {
+				rd := n.Ready()
+				if id == 3 && rd.Snapshot != nil {
+					installed = rd.Snapshot
+				}
+				for _, m := range rd.Messages {
+					c.nodes[m.To].Step(m)
+				}
+				n.Advance(rd)
+			}
+		}
+	}
+	f, l := c.nodes[3], c.nodes[1]
+	if installed == nil || installed.Index != l.log.snapIndex || string(installed.Data) != fmt.Sprintf("state@%d", installed.Index) {
+		t.Fatalf("follower 3 installed %+v, leader snapshot at %d", installed, l.log.snapIndex)
+	}
+	if f.Commit() != l.Commit() || f.LastIndex() != l.LastIndex() {
+		t.Fatalf("follower commit %d last %d, leader commit %d last %d", f.Commit(), f.LastIndex(), l.Commit(), l.LastIndex())
+	}
+	// and it keeps replicating normally after the snapshot
+	idx := c.propose(1, "after")
+	if f.Commit() < idx {
+		t.Fatalf("follower commit %d after the snapshot, want %d", f.Commit(), idx)
+	}
+}
+
+func TestStaleSnapshotIsIgnored(t *testing.T) {
+	c := newCluster(t, 3)
+	c.elect(1)
+	for i := range 5 {
+		c.propose(1, fmt.Sprint(i))
+	}
+	f := c.nodes[2]
+	commit, last := f.Commit(), f.LastIndex()
+	f.Step(Message{Type: MsgSnap, From: 1, To: 2, Term: f.Term(), Snapshot: &Snapshot{Index: 2, Term: 1, Data: []byte("old")}})
+	rd := f.Ready()
+	f.Advance(rd)
+	if rd.Snapshot != nil || f.Commit() != commit || f.LastIndex() != last {
+		t.Fatalf("a stale snapshot was installed: snap=%v commit %d->%d last %d->%d", rd.Snapshot, commit, f.Commit(), last, f.LastIndex())
+	}
+	if m := rd.Messages[0]; !m.Success || m.MatchIndex != commit {
+		t.Fatalf("answer %v, want success with match %d", m, commit)
+	}
+}
+
+func TestRestartFromSnapshot(t *testing.T) {
+	c := newCluster(t, 3)
+	c.elect(1)
+	for i := range 5 {
+		c.propose(1, fmt.Sprint(i))
+	}
+	c.nodes[2].Compact(4, []byte("s"))
+	n := c.nodes[2]
+	snap := n.snapshot
+	hs := n.hardState()
+	entries := n.Entries()
+	r := NewNodeFromSnapshot(n.cfg, hs, snap, entries, snap.Index)
+	if r.FirstIndex() != 5 || r.LastIndex() != n.LastIndex() || r.Commit() != n.Commit() {
+		t.Fatalf("restarted: first %d last %d commit %d; before: last %d commit %d", r.FirstIndex(), r.LastIndex(),
+			r.Commit(), n.LastIndex(), n.Commit())
+	}
+	rd := r.Ready()
+	if len(rd.Committed) == 0 || rd.Committed[0].Index != 5 {
+		t.Fatalf("restarted node re-applies %v, want from index 5", rd.Committed)
+	}
+}

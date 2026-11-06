@@ -14,6 +14,9 @@ var ErrNotLeader = errors.New("raft: not the leader")
 // of its own term, so it does not know the cluster's commit index yet. Retry shortly.
 var ErrReadNotReady = errors.New("raft: leader has not committed in its term yet")
 
+// ErrCompacted is returned by Compact for an index the log no longer holds, or one not applied yet.
+var ErrCompacted = errors.New("raft: cannot compact at that index")
+
 // Node is one Raft peer. It is not safe for concurrent use; the caller serialises calls.
 type Node struct {
 	cfg   Config
@@ -43,6 +46,9 @@ type Node struct {
 	reads      []pendingRead // leader: reads waiting for a majority to confirm leadership
 	readStates []ReadState
 
+	snapshot        Snapshot  // the latest snapshot, sent to followers that need compacted entries
+	pendingSnapshot *Snapshot // installed from the leader, not yet handed out by Ready
+
 	msgs   []Message
 	prevHS HardState
 }
@@ -58,19 +64,27 @@ type pendingRead struct {
 // applied is the last index the state machine already contains; entries after it up to the
 // persisted commit index are handed out again by Ready.
 func NewNode(cfg Config, hs HardState, entries []Entry, applied Index) *Node {
+	return NewNodeFromSnapshot(cfg, hs, Snapshot{}, entries, applied)
+}
+
+// NewNodeFromSnapshot is NewNode for a node that persisted a snapshot and the entries after it.
+// The caller restores its state machine from snap first, so applied is at least snap.Index.
+func NewNodeFromSnapshot(cfg Config, hs HardState, snap Snapshot, entries []Entry, applied Index) *Node {
 	cfg.setDefaults()
 	peers := slices.Clone(cfg.Peers)
 	slices.Sort(peers)
 	n := &Node{
-		cfg:     cfg,
-		id:      cfg.ID,
-		peers:   peers,
-		term:    hs.Term,
-		vote:    hs.Vote,
-		commit:  hs.Commit,
-		applied: applied,
-		rng:     rand.New(rand.NewPCG(cfg.Seed, uint64(cfg.ID))),
+		cfg:      cfg,
+		id:       cfg.ID,
+		peers:    peers,
+		term:     hs.Term,
+		vote:     hs.Vote,
+		commit:   max(hs.Commit, snap.Index),
+		applied:  max(applied, snap.Index),
+		rng:      rand.New(rand.NewPCG(cfg.Seed, uint64(cfg.ID))),
+		snapshot: snap,
 	}
+	n.log.restore(snap)
 	n.log.entries = cloneEntries(entries)
 	n.log.stable = n.log.lastIndex()
 	if n.commit > n.log.lastIndex() {
@@ -149,6 +163,19 @@ func (n *Node) ReadIndex(ctx uint64) error {
 	return nil
 }
 
+// Compact tells the node the state machine's state as of index (already applied) is saved as
+// data. The log drops every entry up to index, and data is what the leader will send to a
+// follower that needs any of them. The caller persists the snapshot before dropping its stored
+// entries.
+func (n *Node) Compact(index Index, data []byte) error {
+	if index <= n.log.snapIndex || index > n.applied {
+		return ErrCompacted
+	}
+	n.snapshot = Snapshot{Index: index, Term: n.log.term(index), Data: data}
+	n.log.compact(index)
+	return nil
+}
+
 // Step processes one message from a peer.
 func (n *Node) Step(m Message) {
 	switch {
@@ -163,7 +190,7 @@ func (n *Node) Step(m Message) {
 			// a granted pre-vote echoes the term we would campaign for
 		default:
 			lead := None
-			if m.Type == MsgApp {
+			if m.Type == MsgApp || m.Type == MsgSnap {
 				lead = m.From
 			}
 			n.becomeFollower(m.Term, lead)
@@ -171,7 +198,7 @@ func (n *Node) Step(m Message) {
 	case m.Term < n.term:
 		// A stale leader or candidate learns the current term from the rejection and steps down.
 		switch m.Type {
-		case MsgApp:
+		case MsgApp, MsgSnap:
 			n.send(Message{Type: MsgAppResp, To: m.From, Success: false})
 		case MsgVote:
 			n.send(Message{Type: MsgVoteResp, To: m.From, Granted: false})
@@ -194,6 +221,8 @@ func (n *Node) Step(m Message) {
 		n.handleAppend(m)
 	case MsgAppResp:
 		n.handleAppendResp(m)
+	case MsgSnap:
+		n.handleSnapshot(m)
 	}
 }
 
@@ -202,7 +231,7 @@ func (n *Node) Step(m Message) {
 // HasReady reports whether Ready would return anything.
 func (n *Node) HasReady() bool {
 	return len(n.msgs) > 0 || n.log.stable < n.log.lastIndex() || n.hardState() != n.prevHS || n.commit > n.applied ||
-		len(n.readStates) > 0
+		len(n.readStates) > 0 || n.pendingSnapshot != nil
 }
 
 // Ready collects the node's output. See the Ready type for the caller's obligations.
@@ -212,12 +241,13 @@ func (n *Node) Ready() Ready {
 		SoftState:  SoftState{Role: n.role, Lead: n.lead},
 		HardState:  hs,
 		MustSync:   hs != n.prevHS,
+		Snapshot:   n.pendingSnapshot,
 		Entries:    n.log.unstable(),
 		Messages:   n.msgs,
 		Committed:  n.log.slice(n.applied+1, n.commit),
 		ReadStates: n.readStates,
 	}
-	n.msgs, n.readStates = nil, nil
+	n.msgs, n.readStates, n.pendingSnapshot = nil, nil, nil
 	return rd
 }
 
@@ -243,6 +273,11 @@ func (n *Node) Term() Term       { return n.term }
 func (n *Node) Leader() NodeID   { return n.lead }
 func (n *Node) Commit() Index    { return n.commit }
 func (n *Node) LastIndex() Index { return n.log.lastIndex() }
+
+// FirstIndex is the first index still in the log; everything before it is in the snapshot.
+func (n *Node) FirstIndex() Index { return n.log.firstIndex() }
+
+// Entries returns the log after the snapshot.
 func (n *Node) Entries() []Entry { return n.log.slice(1, n.log.lastIndex()) }
 func (n *Node) hardState() HardState {
 	return HardState{Term: n.term, Vote: n.vote, Commit: n.commit}
@@ -419,6 +454,14 @@ func (n *Node) broadcastAppend() {
 func (n *Node) sendAppend(to NodeID) {
 	next := n.next[to]
 	prev := next - 1
+	if prev < n.log.snapIndex {
+		// The follower needs entries we no longer have. Assume the snapshot arrives; if it does
+		// not, the follower rejects the next append and we land here again.
+		snap := n.snapshot
+		n.send(Message{Type: MsgSnap, To: to, Snapshot: &snap, ReadSeq: n.readSeq})
+		n.next[to] = snap.Index + 1
+		return
+	}
 	hi := min(n.log.lastIndex(), prev+Index(n.cfg.MaxEntriesPerMsg))
 	n.send(Message{
 		Type:      MsgApp,
@@ -436,6 +479,17 @@ func (n *Node) handleAppend(m Message) {
 	n.role = Follower
 	n.lead = m.From
 	n.resetElectionTimer()
+
+	// Entries up to our snapshot are committed, so they match the leader's: skip that part.
+	if m.PrevIndex < n.log.snapIndex {
+		skip := n.log.snapIndex - m.PrevIndex
+		if Index(len(m.Entries)) <= skip {
+			n.send(Message{Type: MsgAppResp, To: m.From, Success: true, MatchIndex: n.log.snapIndex, ReadSeq: m.ReadSeq})
+			return
+		}
+		m.Entries = m.Entries[skip:]
+		m.PrevIndex, m.PrevTerm = n.log.snapIndex, n.log.snapTerm
+	}
 
 	// Every answer echoes ReadSeq, rejections included: a rejection in this term still says
 	// "you are my leader", which is all a read needs.
@@ -461,6 +515,31 @@ func (n *Node) handleAppend(m Message) {
 		n.commit = c
 	}
 	n.send(Message{Type: MsgAppResp, To: m.From, Success: true, MatchIndex: lastNew, ReadSeq: m.ReadSeq})
+}
+
+// handleSnapshot is InstallSnapshot on the follower (Figure 13 of the Raft paper).
+func (n *Node) handleSnapshot(m Message) {
+	n.role = Follower
+	n.lead = m.From
+	n.resetElectionTimer()
+	s := *m.Snapshot
+	ok := func(match Index) {
+		n.send(Message{Type: MsgAppResp, To: m.From, Success: true, MatchIndex: match, ReadSeq: m.ReadSeq})
+	}
+	if s.Index <= n.commit && !n.cfg.Unsafe.InstallStaleSnapshot {
+		ok(n.commit) // late or duplicated: we are already past it, and committed entries match the leader's
+		return
+	}
+	if s.Index > n.commit && n.log.term(s.Index) == s.Term {
+		n.commit = s.Index // we hold that entry already: keep the log after it (Log Matching)
+		ok(s.Index)
+		return
+	}
+	n.log.restore(s)
+	n.snapshot = s
+	n.commit, n.applied = s.Index, s.Index
+	n.pendingSnapshot = &s
+	ok(s.Index)
 }
 
 func (n *Node) handleAppendResp(m Message) {
