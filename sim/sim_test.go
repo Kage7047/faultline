@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,18 +18,26 @@ var (
 	only  = flag.Uint64("seed", 0, "run just this seed (to reproduce a failure)")
 )
 
-// modes are the two configurations every safety test runs in. PreVote and CheckQuorum make
-// elections rarer, which is good for a cluster and bad for a test: fewer elections means fewer
-// chances to hit an election bug. So the classic mode, with both off, runs too.
+// modes are the configurations every safety test runs in. PreVote and CheckQuorum make elections
+// rarer, which is good for a cluster and bad for a test: fewer elections means fewer chances to
+// hit an election bug. Snapshots let a lagging follower skip the slow entry-by-entry catch-up
+// that some bugs need. So besides everything on, the tests run with PreVote and CheckQuorum off
+// (classic) and with snapshots off as well (bare).
 var modes = []struct {
 	name string
 	set  func(*Config)
 }{
 	{"prevote", func(*Config) {}},
 	{"classic", classic},
+	{"bare", bare},
 }
 
 func classic(c *Config) { c.Raft.PreVote, c.Raft.CheckQuorum = false, false }
+
+func bare(c *Config) {
+	classic(c)
+	c.SnapshotEvery = 0
+}
 
 // TestSafety runs many seeded simulations with crashes, partitions, loss, duplication and
 // reordering, and fails on the first safety violation with a command that replays it.
@@ -66,8 +75,12 @@ func testSafety(t *testing.T, mode func(*Config)) {
 			}
 		}
 	})
-	t.Logf("%d seeds: leaders=%d proposed=%d committed=%d crashes=%d partitions=%d msgs=%d dropped=%d",
-		n, total.Leaders, total.Proposed, total.Committed, total.Crashes, total.Partitions, total.Sent, total.Dropped)
+	t.Logf("%d seeds: leaders=%d proposed=%d committed=%d crashes=%d partitions=%d msgs=%d dropped=%d compactions=%d installs=%d",
+		n, total.Leaders, total.Proposed, total.Committed, total.Crashes, total.Partitions, total.Sent, total.Dropped,
+		total.Compactions, total.Installs)
+	if total.Installs == 0 && n >= 30 && Defaults(1).SnapshotEvery > 0 && !strings.Contains(t.Name(), "bare") {
+		t.Error("no follower ever installed a snapshot: the InstallSnapshot path went untested")
+	}
 }
 
 // TestLivenessWithoutFaults: with a healthy network the cluster elects one leader and commits
@@ -102,21 +115,27 @@ func TestControlGrantAnyVoteIsCaught(t *testing.T) {
 // Figure 8's bug needs an old-term entry to reach a majority before the new leader's no-op does.
 // When both travel in one message that almost never happens, so this control sends one entry
 // per message, which lets old entries run ahead of the no-op on a lagging follower. It also
-// needs leader churn, so it runs in classic mode: with PreVote and CheckQuorum on, 2,000 seeds
-// did not open the window once.
+// needs leader churn and a follower catching up one entry at a time, so it runs in bare mode:
+// with PreVote and CheckQuorum on, or with snapshots on, 2,000 seeds did not open the window once.
 func TestControlCommitOldTermsIsCaught(t *testing.T) {
 	requireCaught(t, func(c *Config) {
-		classic(c)
+		bare(c)
 		c.Raft.Unsafe.CommitOldTerms = true
 		c.Raft.MaxEntriesPerMsg = 1
 	})
+}
+
+// A delayed or duplicated InstallSnapshot that is older than what the follower has committed must
+// be ignored. Installing it anyway rolls the follower's state machine back.
+func TestControlInstallStaleSnapshotIsCaught(t *testing.T) {
+	requireCaught(t, func(c *Config) { c.Raft.Unsafe.InstallStaleSnapshot = true })
 }
 
 // The same small messages with the rule intact must stay safe, or the control proves nothing.
 func TestOneEntryPerMessageIsSafe(t *testing.T) {
 	parallel(1, 200, func(seed uint64) {
 		cfg := Defaults(seed)
-		classic(&cfg)
+		bare(&cfg)
 		cfg.Raft.MaxEntriesPerMsg = 1
 		if r := Run(cfg); r.Violation != "" {
 			t.Errorf("%s", r)
@@ -188,6 +207,8 @@ func add(t *Stats, s Stats) {
 	t.Partitions += s.Partitions
 	t.Sent += s.Sent
 	t.Dropped += s.Dropped
+	t.Compactions += s.Compactions
+	t.Installs += s.Installs
 }
 
 func TestRunIsDeterministic(t *testing.T) {

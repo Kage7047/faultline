@@ -47,8 +47,9 @@ func testLinearizable(t *testing.T, mode func(*Config)) {
 			t.Errorf("seed %d: only %d operations completed", seed, r.Stats.Ops)
 		}
 	})
-	t.Logf("%d seeds: ops=%d retries=%d leaders=%d crashes=%d partitions=%d msgs=%d inconclusive=%d",
-		n, total.Ops, total.Retries, total.Leaders, total.Crashes, total.Partitions, total.Sent, inconclusive.Load())
+	t.Logf("%d seeds: ops=%d retries=%d leaders=%d crashes=%d partitions=%d msgs=%d installs=%d inconclusive=%d",
+		n, total.Ops, total.Retries, total.Leaders, total.Crashes, total.Partitions, total.Sent, total.Installs,
+		inconclusive.Load())
 	if inconclusive.Load() > 0 {
 		t.Errorf("%d runs were too big for the checker to decide", inconclusive.Load())
 	}
@@ -58,6 +59,12 @@ func testLinearizable(t *testing.T, mode func(*Config)) {
 
 func TestControlNoDedupIsCaught(t *testing.T) {
 	requireCaughtKV(t, func(c *Config) { c.UnsafeNoDedup = true })
+}
+
+// A snapshot must carry the session table. A replica restored without it forgets which requests
+// it already applied, and applies a retried write a second time.
+func TestControlSnapshotWithoutSessionsIsCaught(t *testing.T) {
+	requireCaughtKV(t, func(c *Config) { c.UnsafeSnapshotWithoutSessions = true })
 }
 
 // A leader answering a read without the heartbeat round is only wrong while it is a stale leader:

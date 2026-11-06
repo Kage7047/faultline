@@ -11,8 +11,10 @@
 package kv
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
+	"slices"
 )
 
 // Op is what a command does.
@@ -78,6 +80,9 @@ type Store struct {
 
 	// Unsafe disables deduplication, for the control test that proves duplicates are detected.
 	UnsafeNoDedup bool
+	// UnsafeSnapshotWithoutSessions leaves the session table out of snapshots, a classic bug:
+	// a replica restored from one forgets which requests it already applied.
+	UnsafeSnapshotWithoutSessions bool
 }
 
 // New returns an empty store.
@@ -103,6 +108,51 @@ func (s *Store) Apply(c Command) Result {
 	r := Result{Value: s.data[c.Key]}
 	s.sessions[c.Client] = session{seq: c.Seq, result: r}
 	return r
+}
+
+type snapshotSession struct {
+	Seq    uint64 `json:"s"`
+	Value  string `json:"v"`
+	Client uint64 `json:"c"`
+}
+
+type snapshot struct {
+	Data     map[string]string `json:"data"`
+	Sessions []snapshotSession `json:"sessions,omitempty"`
+}
+
+// Snapshot encodes the whole state: the data and the session table. Without the sessions, a
+// replica restored from the snapshot would apply a retried write a second time.
+func (s *Store) Snapshot() []byte {
+	snap := snapshot{Data: s.data}
+	if !s.UnsafeSnapshotWithoutSessions {
+		for c, sess := range s.sessions {
+			snap.Sessions = append(snap.Sessions, snapshotSession{Client: c, Seq: sess.seq, Value: sess.result.Value})
+		}
+		slices.SortFunc(snap.Sessions, func(a, b snapshotSession) int { return cmp.Compare(a.Client, b.Client) })
+	}
+	b, err := json.Marshal(snap) // map keys are sorted, so equal states encode equally
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// Restore replaces the state with a snapshot's.
+func (s *Store) Restore(b []byte) error {
+	var snap snapshot
+	if err := json.Unmarshal(b, &snap); err != nil {
+		return err
+	}
+	s.data = snap.Data
+	if s.data == nil {
+		s.data = map[string]string{}
+	}
+	s.sessions = map[uint64]session{}
+	for _, sess := range snap.Sessions {
+		s.sessions[sess.Client] = session{seq: sess.Seq, result: Result{Value: sess.Value}}
+	}
+	return nil
 }
 
 // Read returns a key's value from this replica's local state, without going through the log.

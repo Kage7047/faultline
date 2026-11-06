@@ -2,10 +2,33 @@ package sim
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 
 	"github.com/Kage7047/faultline/raft"
 )
+
+// digest is a hash chain over applied entries: digest(i) = sha256(digest(i-1), entry i). Two
+// replicas that applied the same log prefix hold the same digest, so a snapshot can be checked
+// against the committed log without replaying it.
+type digest [sha256.Size]byte
+
+func (d digest) next(e raft.Entry) digest {
+	h := sha256.New()
+	h.Write(d[:])
+	var b [17]byte
+	binary.BigEndian.PutUint64(b[0:], uint64(e.Index))
+	binary.BigEndian.PutUint64(b[8:], uint64(e.Term))
+	if e.Data == nil {
+		b[16] = 1 // a no-op, distinct from an empty proposal
+	}
+	h.Write(b[:])
+	h.Write(e.Data)
+	var out digest
+	h.Sum(out[:0])
+	return out
+}
 
 // checker watches a run for violations of the safety properties in Figure 3 of the Raft paper.
 // It is fed from the outside (what each node reports) and never looks at a node's internals,
@@ -13,6 +36,7 @@ import (
 type checker struct {
 	leaders   map[raft.Term]raft.NodeID // Election Safety: one leader per term
 	committed map[raft.Index]raft.Entry // what was applied at each index, by anyone
+	digests   map[raft.Index]digest     // the hash chain of the committed log
 	applied   map[raft.NodeID]raft.Index
 	maxIndex  raft.Index
 }
@@ -21,27 +45,31 @@ func newChecker() *checker {
 	return &checker{
 		leaders:   map[raft.Term]raft.NodeID{},
 		committed: map[raft.Index]raft.Entry{},
+		digests:   map[raft.Index]digest{0: {}},
 		applied:   map[raft.NodeID]raft.Index{},
 	}
 }
 
-func (c *checker) restarted(id raft.NodeID) { c.applied[id] = 0 }
+// restarted is called when a node comes back with its state machine restored up to applied.
+func (c *checker) restarted(id raft.NodeID, applied raft.Index) { c.applied[id] = applied }
 
 func (c *checker) maxCommitted() raft.Index { return c.maxIndex }
 
-// leader is called when a node becomes leader of a term, with its log at that moment.
-func (c *checker) leader(id raft.NodeID, term raft.Term, log []raft.Entry) string {
+// leader is called when a node becomes leader of a term, with its log from first on (everything
+// before first is in its snapshot, which was checked when it was taken or installed).
+func (c *checker) leader(id raft.NodeID, term raft.Term, first raft.Index, log []raft.Entry) string {
 	if other, ok := c.leaders[term]; ok && other != id {
 		return fmt.Sprintf("election safety: nodes %d and %d both lead term %d", other, id, term)
 	}
 	c.leaders[term] = id
 	// Leader Completeness: a leader's log holds every entry committed in an earlier term.
-	for idx := raft.Index(1); idx <= c.maxIndex; idx++ { // in index order, so reports are deterministic
+	last := first + raft.Index(len(log)) - 1
+	for idx := first; idx <= c.maxIndex; idx++ { // in index order, so reports are deterministic
 		e, ok := c.committed[idx]
 		if !ok {
 			continue
 		}
-		if int(idx) > len(log) || !sameEntry(log[idx-1], e) {
+		if idx > last || !sameEntry(log[idx-first], e) {
 			return fmt.Sprintf("leader completeness: leader %d of term %d is missing committed entry %d (term %d, %q)",
 				id, term, idx, e.Term, e.Data)
 		}
@@ -65,25 +93,52 @@ func (c *checker) apply(id raft.NodeID, e raft.Entry) string {
 		return ""
 	}
 	c.committed[e.Index] = e
+	// Whoever applies an index first applied the one before it too (or it was in a snapshot that
+	// someone built by applying it), so the chain is never broken.
+	c.digests[e.Index] = c.digests[e.Index-1].next(e)
 	c.maxIndex = max(c.maxIndex, e.Index)
 	return ""
 }
 
-// logMatching checks the Log Matching property across the final persisted logs: if two logs
-// hold an entry with the same index and term, the logs are identical up to that index.
+// snapshot is called when a node installs a snapshot from the leader. Its state must be the
+// committed log up to that index, and it must not move the node backwards.
+func (c *checker) snapshot(id raft.NodeID, index raft.Index, d digest) string {
+	if index < c.applied[id] {
+		return fmt.Sprintf("node %d rolled back from applied index %d to a snapshot at %d", id, c.applied[id], index)
+	}
+	want, ok := c.digests[index]
+	if !ok {
+		return fmt.Sprintf("node %d installed a snapshot at %d, which nobody had applied", id, index)
+	}
+	if d != want {
+		return fmt.Sprintf("state machine safety: node %d installed a snapshot at %d that does not match the committed log",
+			id, index)
+	}
+	c.applied[id] = index
+	return ""
+}
+
+// logMatching checks the Log Matching property across the final persisted logs (each starting
+// after its own snapshot): if two logs hold an entry with the same index and term, the logs are
+// identical up to that index.
 func logMatching(logs [][]raft.Entry) string {
 	for a := range logs {
 		for b := a + 1; b < len(logs); b++ {
 			la, lb := logs[a], logs[b]
-			n := min(len(la), len(lb))
-			for i := n - 1; i >= 0; i-- {
-				if la[i].Term != lb[i].Term {
+			if len(la) == 0 || len(lb) == 0 {
+				continue
+			}
+			fa, fb := la[0].Index, lb[0].Index
+			lo := max(fa, fb)
+			hi := min(fa+raft.Index(len(la)), fb+raft.Index(len(lb))) - 1
+			for i := hi; i >= lo && i > 0; i-- {
+				if la[i-fa].Term != lb[i-fb].Term {
 					continue
 				}
-				for j := 0; j <= i; j++ {
-					if !sameEntry(la[j], lb[j]) {
+				for j := lo; j <= i; j++ {
+					if !sameEntry(la[j-fa], lb[j-fb]) {
 						return fmt.Sprintf("log matching: nodes %d and %d agree at index %d (term %d) but differ at index %d",
-							a+1, b+1, i+1, la[i].Term, j+1)
+							a+1, b+1, i, la[i-fa].Term, j)
 					}
 				}
 				break

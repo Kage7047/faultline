@@ -62,10 +62,19 @@ const (
 	MsgAppResp
 	MsgPreVote
 	MsgPreVoteResp
+	MsgSnap // InstallSnapshot: the follower needs entries the leader has compacted away
 )
 
 func (t MsgType) String() string {
-	return [...]string{"MsgVote", "MsgVoteResp", "MsgApp", "MsgAppResp", "MsgPreVote", "MsgPreVoteResp"}[t]
+	return [...]string{"MsgVote", "MsgVoteResp", "MsgApp", "MsgAppResp", "MsgPreVote", "MsgPreVoteResp", "MsgSnap"}[t]
+}
+
+// Snapshot is the state machine as of Index (whose entry had Term), in the application's own
+// encoding. Raft never looks inside Data.
+type Snapshot struct {
+	Index Index
+	Term  Term
+	Data  []byte
 }
 
 // Message is every RPC and response in one struct. Fields not used by a type stay zero.
@@ -86,6 +95,9 @@ type Message struct {
 	PrevTerm  Term
 	Entries   []Entry
 	Commit    Index
+
+	// MsgSnap
+	Snapshot *Snapshot
 
 	// MsgAppResp. On success MatchIndex is the last index known to match the leader.
 	// On rejection the follower sends a hint so the leader can skip a whole term at a time:
@@ -110,6 +122,8 @@ func (m Message) String() string {
 	case MsgApp:
 		return fmt.Sprintf("%d->%d %s t%d prev=%d@t%d n=%d commit=%d", m.From, m.To, m.Type, m.Term, m.PrevIndex,
 			m.PrevTerm, len(m.Entries), m.Commit)
+	case MsgSnap:
+		return fmt.Sprintf("%d->%d %s t%d snap=%d@t%d", m.From, m.To, m.Type, m.Term, m.Snapshot.Index, m.Snapshot.Term)
 	default:
 		return fmt.Sprintf("%d->%d %s t%d ok=%v match=%d conflict=%d@t%d", m.From, m.To, m.Type, m.Term, m.Success,
 			m.MatchIndex, m.ConflictIndex, m.ConflictTerm)
@@ -137,17 +151,20 @@ type ReadState struct {
 }
 
 // Ready is everything a Node produced since the last Advance. The caller must, in order:
-//  1. persist HardState (if MustSync) and Entries (overwriting any stored entries at or after
+//  1. if Snapshot is set: persist it, drop every stored entry (they are all replaced by it) and
+//     restore the state machine from it,
+//  2. persist HardState (if MustSync) and Entries (overwriting any stored entries at or after
 //     Entries[0].Index, which may have been truncated),
-//  2. send Messages,
-//  3. apply Committed to the state machine,
-//  4. serve each ReadState once the state machine has applied its Index,
+//  3. send Messages,
+//  4. apply Committed to the state machine,
+//  5. serve each ReadState once the state machine has applied its Index,
 //
 // then call Advance.
 type Ready struct {
 	SoftState  SoftState
 	HardState  HardState
 	MustSync   bool
+	Snapshot   *Snapshot // installed from the leader
 	Entries    []Entry
 	Messages   []Message
 	Committed  []Entry
@@ -195,6 +212,9 @@ type Unsafe struct {
 	// ReadBeforeTermCommit answers ReadIndex before the leader has committed an entry of its own
 	// term. Its commit index may then lag writes the previous leader already acknowledged.
 	ReadBeforeTermCommit bool
+	// InstallStaleSnapshot installs any snapshot the leader sends, even one older than what this
+	// node has already committed: a delayed or duplicated InstallSnapshot then rolls it back.
+	InstallStaleSnapshot bool
 }
 
 func (c *Config) setDefaults() {

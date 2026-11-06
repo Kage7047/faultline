@@ -5,6 +5,7 @@
 package sim
 
 import (
+	"bytes"
 	"container/heap"
 	"fmt"
 	"math/rand/v2"
@@ -33,6 +34,9 @@ type Config struct {
 
 	ProposeEvery int64       // raw proposals to a random node (consensus-only runs)
 	Raft         raft.Config // ID, Peers and Seed are filled in per node
+	// SnapshotEvery: a node snapshots its state machine and compacts its log once it has
+	// applied this many entries past its last snapshot. 0 turns snapshots off.
+	SnapshotEvery int
 
 	// Clients > 0 runs the key-value store with that many clients, and checks the history of
 	// what they saw for linearizability at the end.
@@ -43,8 +47,10 @@ type Config struct {
 	// ReadsThroughLog sends gets through the log like writes, instead of ReadIndex. Only for
 	// comparing the two.
 	ReadsThroughLog bool
-	UnsafeNoDedup   bool   // a control: apply retried writes again
-	VisualizePath   string // write Porcupine's HTML view of a non-linearizable history here
+	UnsafeNoDedup   bool // a control: apply retried writes again
+	// UnsafeSnapshotWithoutSessions is a control: snapshots leave out the dedup table.
+	UnsafeSnapshotWithoutSessions bool
+	VisualizePath                 string // write Porcupine's HTML view of a non-linearizable history here
 
 	TraceLen      int  // how many recent events to keep for a failure report
 	TraceMessages bool // also record every delivered message (verbose; for debugging a seed)
@@ -53,19 +59,20 @@ type Config struct {
 // Defaults returns a hostile but realistic configuration.
 func Defaults(seed uint64) Config {
 	return Config{
-		Seed:         seed,
-		Nodes:        5,
-		Duration:     30_000,
-		TickMs:       10,
-		MinLatency:   1,
-		MaxLatency:   30,
-		DropRate:     0.05,
-		DupRate:      0.02,
-		Faults:       true,
-		QuietTail:    5_000,
-		ProposeEvery: 15,
-		Raft:         raft.Config{ElectionTicks: 15, HeartbeatTicks: 3, PreVote: true, CheckQuorum: true},
-		TraceLen:     60,
+		Seed:          seed,
+		Nodes:         5,
+		Duration:      30_000,
+		TickMs:        10,
+		MinLatency:    1,
+		MaxLatency:    30,
+		DropRate:      0.05,
+		DupRate:       0.02,
+		Faults:        true,
+		QuietTail:     5_000,
+		ProposeEvery:  15,
+		Raft:          raft.Config{ElectionTicks: 15, HeartbeatTicks: 3, PreVote: true, CheckQuorum: true},
+		SnapshotEvery: 50,
+		TraceLen:      60,
 	}
 }
 
@@ -93,9 +100,11 @@ type Stats struct {
 	Duplicated  int
 	FinalCommit []raft.Index // per node, at the end
 
-	Reads   int // gets answered through ReadIndex, without a log entry
-	Ops     int // client operations that completed
-	Retries int // client resends after a timeout or a "not leader" answer
+	Reads       int // gets answered through ReadIndex, without a log entry
+	Compactions int // snapshots taken locally
+	Installs    int // snapshots installed from a leader
+	Ops         int // client operations that completed
+	Retries     int // client resends after a timeout or a "not leader" answer
 }
 
 // Result is what a run found.
@@ -112,6 +121,7 @@ func (r Result) String() string {
 	s := r.Stats
 	fmt.Fprintf(&b, "leaders=%d maxTerm=%d proposed=%d committed=%d crashes=%d partitions=%d msgs=%d dropped=%d dup=%d",
 		s.Leaders, s.MaxTerm, s.Proposed, s.Committed, s.Crashes, s.Partitions, s.Sent, s.Dropped, s.Duplicated)
+	fmt.Fprintf(&b, " compactions=%d installs=%d", s.Compactions, s.Installs)
 	if s.Ops > 0 {
 		fmt.Fprintf(&b, " ops=%d retries=%d", s.Ops, s.Retries)
 	}
@@ -121,9 +131,11 @@ func (r Result) String() string {
 	return b.String()
 }
 
+// disk is what survives a crash: the hard state, the latest snapshot and the entries after it.
 type disk struct {
 	hs      raft.HardState
-	entries []raft.Entry
+	snap    raft.Snapshot
+	entries []raft.Entry // entries[0].Index == snap.Index+1
 }
 
 type node struct {
@@ -137,6 +149,7 @@ type node struct {
 	wasLeader raft.Term
 
 	store   *kv.Store
+	digest  digest                // hash chain over every entry applied, carried in snapshots
 	applied raft.Index            // last index the store has applied
 	waiters map[raft.Index]waiter // client requests this node proposed, by log index
 	readCtx uint64                // last ReadIndex ctx handed out
@@ -215,15 +228,52 @@ func (s *Sim) start(n *node) {
 	c := s.cfg.Raft
 	c.ID, c.Peers = n.id, s.peers()
 	c.Seed = s.cfg.Seed*1_000_003 + uint64(n.id)*7919 + n.restarts
-	// A restarted node has an empty state machine: it re-applies the committed log from index 1.
-	n.r = raft.NewNode(c, n.disk.hs, n.disk.entries, 0)
+	// A restarted node rebuilds its state machine from its snapshot, then re-applies the
+	// committed entries after it.
 	n.store = kv.New()
 	n.store.UnsafeNoDedup = s.cfg.UnsafeNoDedup
-	n.applied = 0
+	n.store.UnsafeSnapshotWithoutSessions = s.cfg.UnsafeSnapshotWithoutSessions
+	n.digest, n.applied = digest{}, 0
+	if n.disk.snap.Index > 0 {
+		s.restore(n, n.disk.snap)
+	}
+	n.r = raft.NewNodeFromSnapshot(c, n.disk.hs, n.disk.snap, n.disk.entries, n.applied)
 	n.waiters = map[raft.Index]waiter{}
 	n.reads = map[uint64]pendingGet{}
 	n.ready = nil
-	s.check.restarted(n.id)
+	s.check.restarted(n.id, n.applied)
+}
+
+// snapshotData is the sim's snapshot encoding: the digest of the log so far, then the store.
+func (n *node) snapshotData() []byte {
+	return append(n.digest[:len(n.digest):len(n.digest)], n.store.Snapshot()...)
+}
+
+func (s *Sim) restore(n *node, snap raft.Snapshot) {
+	copy(n.digest[:], snap.Data)
+	if err := n.store.Restore(snap.Data[len(n.digest):]); err != nil {
+		s.fail(fmt.Sprintf("node %d: bad snapshot at %d: %v", n.id, snap.Index, err))
+	}
+	n.applied = snap.Index
+}
+
+// maybeCompact snapshots the state machine once enough has been applied since the last one.
+// The snapshot is persisted before the entries it replaces are dropped.
+func (s *Sim) maybeCompact(n *node) {
+	every := raft.Index(s.cfg.SnapshotEvery)
+	if every == 0 || n.applied < n.disk.snap.Index+every {
+		return
+	}
+	data := n.snapshotData()
+	if err := n.r.Compact(n.applied, data); err != nil {
+		s.fail(fmt.Sprintf("node %d: compact at %d: %v", n.id, n.applied, err))
+		return
+	}
+	cut := int(n.applied - n.disk.snap.Index)
+	term := n.disk.entries[cut-1].Term
+	n.disk.snap = raft.Snapshot{Index: n.applied, Term: term, Data: data}
+	n.disk.entries = append([]raft.Entry(nil), n.disk.entries[cut:]...)
+	s.stats.Compactions++
 }
 
 // step advances virtual time by one millisecond.
@@ -286,12 +336,19 @@ func (s *Sim) deliver(m raft.Message) {
 func (s *Sim) process(n *node) {
 	for n.r != nil && n.r.HasReady() && s.violation == "" {
 		rd := n.r.Ready()
+		if rd.Snapshot != nil {
+			n.disk.snap, n.disk.entries = *rd.Snapshot, nil
+			s.restore(n, *rd.Snapshot)
+			s.stats.Installs++
+			s.logf("node %d installed snapshot at %d", n.id, rd.Snapshot.Index)
+			s.fail(s.check.snapshot(n.id, rd.Snapshot.Index, n.digest))
+		}
 		if rd.MustSync {
 			n.disk.hs = rd.HardState
 		}
 		if len(rd.Entries) > 0 {
-			first := rd.Entries[0].Index
-			n.disk.entries = append(n.disk.entries[:first-1:first-1], rd.Entries...)
+			off := rd.Entries[0].Index - n.disk.snap.Index - 1
+			n.disk.entries = append(n.disk.entries[:off:off], rd.Entries...)
 		}
 		for _, m := range rd.Messages {
 			s.send(m)
@@ -300,12 +357,13 @@ func (s *Sim) process(n *node) {
 			n.wasLeader = rd.HardState.Term
 			s.stats.Leaders++
 			s.logf("leader %d term %d", n.id, rd.HardState.Term)
-			s.fail(s.check.leader(n.id, rd.HardState.Term, n.r.Entries()))
+			s.fail(s.check.leader(n.id, rd.HardState.Term, n.r.FirstIndex(), n.r.Entries()))
 		}
 		s.stats.MaxTerm = max(s.stats.MaxTerm, rd.HardState.Term)
 		for _, e := range rd.Committed {
 			s.fail(s.check.apply(n.id, e))
 			n.applied = e.Index
+			n.digest = n.digest.next(e)
 			if s.cfg.Clients > 0 && e.Data != nil {
 				s.applyCommand(n, e)
 			}
@@ -319,11 +377,16 @@ func (s *Sim) process(n *node) {
 		}
 		s.serveReads(n)
 		n.r.Advance(rd)
+		s.maybeCompact(n)
 	}
 }
 
 func (s *Sim) send(m raft.Message) {
 	s.stats.Sent++
+	if m.Snapshot != nil { // the message keeps the snapshot after the sender moves on
+		snap := *m.Snapshot
+		m.Snapshot = &snap
+	}
 	if s.rng.Float64() < s.cfg.DropRate {
 		s.stats.Dropped++
 		return
@@ -428,6 +491,16 @@ func (s *Sim) finalChecks() {
 		logs = append(logs, n.disk.entries)
 	}
 	s.fail(logMatching(logs))
+	// Replicas that applied the same prefix of the log must hold the same state.
+	for i, a := range s.nodes {
+		for _, b := range s.nodes[i+1:] {
+			if a.r != nil && b.r != nil && a.applied == b.applied && !bytes.Equal(a.store.Snapshot(), b.store.Snapshot()) {
+				s.fail(fmt.Sprintf("replica divergence: nodes %d and %d applied up to %d but hold different state",
+					a.id, b.id, a.applied))
+				return
+			}
+		}
+	}
 }
 
 func (s *Sim) fail(v string) {
