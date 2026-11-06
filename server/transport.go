@@ -158,6 +158,8 @@ func (t *transport) handleRaft(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "busy", http.StatusServiceUnavailable)
 		return
 	}
+	// A slow sender must not hold a slot: the whole body has to arrive within two seconds.
+	http.NewResponseController(w).SetReadDeadline(time.Now().Add(2 * time.Second))
 	// Refuse an unsigned request before reading its body.
 	var got []byte
 	if t.secret != nil {

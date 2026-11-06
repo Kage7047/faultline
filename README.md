@@ -199,8 +199,10 @@ by the transport and again by `raft.Node.Step`, so they never count towards a qu
 not prevented, on purpose: Raft already has to survive duplicated and delayed messages, which
 is what a replay is, and the simulator tests exactly that. A snapshot from the leader is
 decoded before it is written to disk, so a bad one stops the node instead of poisoning every
-restart. Not done: TLS (the HMAC authenticates but does not encrypt) and any authentication on
-the client API. Keep both ports on a private network, or put a proxy in front.
+restart. Unsigned requests are refused before their body is read, at most a few
+`/raft` requests run at once, and each must arrive within two seconds. Not done: TLS or mTLS
+(the HMAC authenticates but does not encrypt), a separate peer-only listener, and any
+authentication on the client API. Keep the ports on a private network, or put a proxy in front.
 
 ## Layout
 
