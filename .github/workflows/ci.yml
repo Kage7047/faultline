@@ -35,8 +35,31 @@ jobs:
         run: go test -v ./...
       - name: race detector
         run: |
-          go test -race ./raft
+          go test -race ./raft ./wal
           go test -race -short -run 'TestSafety|TestLiveness|TestRunIsDeterministic' ./sim
+
+  # the real binary: three processes, kill -9 and SIGSTOP of the leader, Porcupine on the history
+  chaos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: 60 s of faults, then the stale-read control
+        run: go test ./chaos -chaos -chaos.duration 60s -chaos.report chaos.json -chaos.dir chaos-out -v -timeout 10m
+      - name: summary
+        if: always()
+        run: |
+          if [ -f chaos.json ]; then
+            { echo '### chaos run'; echo '```json'; cat chaos.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: keep logs and the failing history
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: chaos-out
+          path: chaos-out
 
   # a different 2,000 seeds on every push: the more seeds ever run, the more the passing result means
   soak:

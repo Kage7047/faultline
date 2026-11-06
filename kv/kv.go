@@ -92,7 +92,7 @@ func New() *Store {
 
 // Apply executes a command and returns its result.
 func (s *Store) Apply(c Command) Result {
-	if prev, ok := s.sessions[c.Client]; ok && c.Seq <= prev.seq && !s.UnsafeNoDedup {
+	if prev, ok := s.sessions[c.Client]; ok && c.Client != 0 && c.Seq <= prev.seq && !s.UnsafeNoDedup {
 		// A retry of something already applied. Clients have one request in flight at a time,
 		// so only the latest result is ever asked for again.
 		r := prev.result
@@ -106,7 +106,9 @@ func (s *Store) Apply(c Command) Result {
 		s.data[c.Key] += c.Value
 	}
 	r := Result{Value: s.data[c.Key]}
-	s.sessions[c.Client] = session{seq: c.Seq, result: r}
+	if c.Client != 0 { // client 0 is anonymous: no session, so no exactly-once retries
+		s.sessions[c.Client] = session{seq: c.Seq, result: r}
+	}
 	return r
 }
 
